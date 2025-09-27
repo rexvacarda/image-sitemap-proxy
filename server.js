@@ -1,4 +1,3 @@
-
 import express from "express";
 import fetch from "node-fetch";
 import crypto from "crypto";
@@ -102,6 +101,20 @@ function verifyProxyHmac(req) {
   return signature === digest;
 }
 
+/* ===== Locale detection from host → Shopify locale code ===== */
+function localeForHost(host) {
+  const h = (host || "").toLowerCase();
+  if (h.endsWith(".fr")) return "fr";
+  if (h.endsWith(".it")) return "it";
+  if (h.endsWith(".nl")) return "nl";
+  if (h.startsWith("ko.")) return "ko";
+  if (h.startsWith("ar.")) return "ar";
+  if (h.startsWith("iw.")) return "he"; // Shopify uses 'he' for Hebrew (not 'iw')
+  if (h.endsWith(".jp") || h.startsWith("ja.")) return "ja";
+  if (h.endsWith(".ch")) return "de"; // adjust per your CH market language
+  return "en";
+}
+
 /* ========== OAuth (public app) minimal flow ========== */
 app.get("/auth", (req, res) => {
   const shop = String(req.query.shop || "");
@@ -176,7 +189,7 @@ async function getAllProductsWithImages(shop, accessToken) {
             onlineStoreUrl
             updatedAt
             images(first:50) {
-              edges { node { url altText } }
+              edges { node { id url altText } }
             }
           }
         }
@@ -208,7 +221,7 @@ async function getAllCollectionsWithImage(shop, accessToken) {
             title
             handle
             updatedAt
-            image { url altText }
+            image { id url altText }
           }
         }
         pageInfo { hasNextPage }
@@ -228,7 +241,102 @@ async function getAllCollectionsWithImage(shop, accessToken) {
   return all;
 }
 
-/* ========== XML builders (with titles + captions, host-pref images) ========== */
+/* ====== Translation hydration (Admin API translations) ====== */
+
+async function hydrateProductTranslations(shop, accessToken, products, locale) {
+  if (!locale || locale === "en" || !products.length) return;
+  const ids = products.map(p => p.id);
+
+  const query = `
+    query Nodes($ids:[ID!]!, $locale: String!) {
+      nodes(ids: $ids) {
+        ... on Product {
+          id
+          translations(locale: $locale) { key value }
+          images(first: 50) {
+            edges {
+              node {
+                id
+                url
+                altText
+                translations(locale: $locale) { key value }
+              }
+            }
+          }
+        }
+      }
+    }
+  `;
+  const { data } = await shopifyGraphQL(shop, accessToken, query, { ids, locale });
+  const nodes = data?.nodes || [];
+
+  const byId = new Map(nodes.map(n => [n.id, n]));
+  for (const p of products) {
+    const tNode = byId.get(p.id);
+    if (!tNode) continue;
+
+    // product title translation
+    const tTitle = (tNode.translations || []).find(t => t.key === "title")?.value;
+    if (tTitle) p.title = tTitle;
+
+    // image alt translations
+    const transEdges = tNode.images?.edges || [];
+    const altByImageId = new Map();
+    for (const e of transEdges) {
+      const trAlt = (e.node.translations || []).find(t => t.key === "alt")?.value;
+      if (trAlt) altByImageId.set(e.node.id, trAlt);
+    }
+    for (const e of (p.images?.edges || [])) {
+      const id = e.node.id;
+      const tr = altByImageId.get(id);
+      if (tr) e.node.altText = tr;
+    }
+  }
+}
+
+async function hydrateCollectionTranslations(shop, accessToken, collections, locale) {
+  if (!locale || locale === "en" || !collections.length) return;
+  const ids = collections.map(c => c.id);
+
+  const query = `
+    query Nodes($ids:[ID!]!, $locale: String!) {
+      nodes(ids: $ids) {
+        ... on Collection {
+          id
+          translations(locale: $locale) { key value }
+          image {
+            id
+            url
+            altText
+            translations(locale: $locale) { key value }
+          }
+        }
+      }
+    }
+  `;
+  const { data } = await shopifyGraphQL(shop, accessToken, query, { ids, locale });
+  const nodes = data?.nodes || [];
+  const byId = new Map(nodes.map(n => [n.id, n]));
+
+  for (const c of collections) {
+    const tNode = byId.get(c.id);
+    if (!tNode) continue;
+
+    const tTitle = (tNode.translations || []).find(t => t.key === "title")?.value;
+    if (tTitle) c.title = tTitle;
+
+    const img = tNode.image;
+    if (img) {
+      const trAlt = (img.translations || []).find(t => t.key === "alt")?.value;
+      if (trAlt) {
+        if (!c.image) c.image = {};
+        c.image.altText = trAlt;
+      }
+    }
+  }
+}
+
+/* ========== XML builders (title = product/collection title; caption = image alt) ========== */
 
 function buildImageNode(loc, title, caption) {
   return `
@@ -256,7 +364,7 @@ function buildUrlNode(pageLoc, lastmodISO, imageNodes) {
     - type=products|collections|all  (default: all)
     - page=1..N                      (default: 1)
     - per_page=number                (default: env DEFAULT_PER_PAGE, max MAX_URLS_PER_FEED)
-    - captions=0|1                   (default: 1) include <image:caption> using alt text
+    - captions=0|1                   (default: 1) include <image:caption> using image alt text
     - prefer_host=0|1                (default: 1) rewrite cdn.shopify.com to https://{host}/cdn/shop/...
 */
 app.get("/image.xml", async (req, res) => {
@@ -290,18 +398,24 @@ app.get("/image.xml", async (req, res) => {
         .send(`App not installed for ${shop}. Visit ${HOST}/auth?shop=${shop}`);
     }
 
+    const locale = localeForHost(host);
     const nodes = [];
 
     if (type === "products" || type === "all") {
       const products = await getAllProductsWithImages(shop, tokenEntry.accessToken);
+
+      // hydrate translations for locale (title + image alt)
+      await hydrateProductTranslations(shop, tokenEntry.accessToken, products, locale);
+
       for (const p of products) {
         const pageUrl = pageUrlForProduct(host, p.handle, p.onlineStoreUrl);
         const images = (p.images?.edges || []).map((e) => e.node);
         if (!images.length) continue;
+
         const imageNodes = images.map((img) => {
           const imgUrl = preferHost ? preferHostImageUrl(img.url, host) : img.url;
-          const title = img.altText || ""; // strict: only use existing altText
-          const caption = includeCaptions && img.altText ? img.altText : ""; // use alt as caption too
+          const title = p.title || ""; // use product title (already localized)
+          const caption = includeCaptions && img.altText ? img.altText : ""; // only use existing alt as caption
           return buildImageNode(imgUrl, title, caption);
         });
         nodes.push({ lastmod: p.updatedAt, xml: buildUrlNode(pageUrl, p.updatedAt, imageNodes) });
@@ -310,11 +424,15 @@ app.get("/image.xml", async (req, res) => {
 
     if (type === "collections" || type === "all") {
       const collections = await getAllCollectionsWithImage(shop, tokenEntry.accessToken);
+
+      // hydrate translations for locale (title + image alt)
+      await hydrateCollectionTranslations(shop, tokenEntry.accessToken, collections, locale);
+
       for (const c of collections) {
         if (!c.image?.url) continue;
         const pageUrl = pageUrlForCollection(host, c.handle);
         const imgUrl = preferHost ? preferHostImageUrl(c.image.url, host) : c.image.url;
-        const title = c.image.altText || "";
+        const title = c.title || ""; // collection title (localized)
         const caption = includeCaptions && c.image.altText ? c.image.altText : "";
         const imageNodes = [buildImageNode(imgUrl, title, caption)];
         nodes.push({ lastmod: c.updatedAt, xml: buildUrlNode(pageUrl, c.updatedAt, imageNodes) });
