@@ -5,12 +5,14 @@ import crypto from "crypto";
 const app = express();
 
 /* ========= CONFIG via ENV =========
-SHOP:               your admin domain, e.g. smelltoimpress.myshopify.com
-ADMIN_API_TOKEN:    Admin API token with read_products + read_collections
-API_VERSION:        e.g. 2024-04
-SHARED_SECRET:      App Proxy "Shared secret" (from Shopify)
-CACHE_TTL_SECONDS:  e.g. 3600 (1h)
-MAX_URLS_PER_FEED:  e.g. 45000 (keep < 50k)
+Required:
+  SHOP               -> your admin domain, e.g. smelltoimpress.myshopify.com
+  ADMIN_API_TOKEN    -> Admin API token with read_products + read_collections
+  SHARED_SECRET      -> App Proxy "Shared secret" (from Shopify)
+Optional:
+  API_VERSION        -> e.g. 2024-04 (default)
+  CACHE_TTL_SECONDS  -> e.g. 3600 (1h)
+  MAX_URLS_PER_FEED  -> e.g. 45000 (keep < 50k)
 =================================== */
 
 const SHOP = process.env.SHOP; // e.g., smelltoimpress.myshopify.com
@@ -19,6 +21,13 @@ const API_VERSION = process.env.API_VERSION || "2024-04";
 const SHARED_SECRET = process.env.SHARED_SECRET;
 const CACHE_TTL_SECONDS = Number(process.env.CACHE_TTL_SECONDS || 3600);
 const MAX_URLS_PER_FEED = Number(process.env.MAX_URLS_PER_FEED || 45000);
+
+// Ensure required envs exist at startup
+["SHOP", "ADMIN_API_TOKEN", "SHARED_SECRET"].forEach((k) => {
+  if (!process.env[k]) {
+    console.error(`[startup] Missing env var ${k}`);
+  }
+});
 
 /* ========== Helpers ========== */
 
@@ -167,7 +176,10 @@ function buildUrlNode(pageLoc, imageNodes) {
 
 /* ========== Main endpoint ========== */
 /*
-  GET /apps/sitemaps/image.xml
+  Shopify proxies:
+    /apps/sitemaps/image.xml       -> our server route /image.xml
+    /apps/sitemaps/image-index.xml -> our server route /image-index.xml
+
   Optional query:
     - type=products|collections|all (default: all)
     - page=1..N (simple pagination after combining URLs)
@@ -225,11 +237,6 @@ ${slice.join("\n")}
 });
 
 /* ========== Optional: index for paginated feeds ========== */
-/*
-  Example: expose /apps/sitemaps/image-index.xml that lists several pages.
-  You could first compute total count and number of pages; for simplicity,
-  this static example lists first 5 pages for 'all' type.
-*/
 app.get("/image-index.xml", (req, res) => {
   const host = stripPort(req.get("x-forwarded-host") || req.get("host"));
   const urls = Array.from({ length: 5 }, (_, i) => i + 1).map(
@@ -243,8 +250,13 @@ ${urls.join("\n")}
   return res.status(200).send(xml);
 });
 
-/* ========== Health check ========== */
-app.get("/health", (_req, res) => res.send("ok"));
+/* ========== Health & Root ========== */
+app.get("/health", (_req, res) => res.type("text/plain").send("ok"));
+app.get("/", (_req, res) => {
+  res
+    .type("text/plain")
+    .send("Image Sitemap Proxy is running. Use /health or call via Shopify App Proxy at /apps/sitemaps/image.xml");
+});
 
 const port = process.env.PORT || 3000;
 app.listen(port, () => console.log(`Image sitemap proxy on :${port}`));
