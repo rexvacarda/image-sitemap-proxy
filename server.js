@@ -1,6 +1,8 @@
+
 import express from "express";
 import fetch from "node-fetch";
 import crypto from "crypto";
+import { URL } from "url";
 
 const app = express();
 
@@ -51,6 +53,33 @@ function x(s = "") {
 
 function stripPort(host) {
   return (host || "").replace(/:.+$/, "");
+}
+
+function preferHostImageUrl(originalUrl, host) {
+  try {
+    const u = new URL(originalUrl);
+    // Only rewrite Shopify CDN URLs
+    if (u.hostname !== "cdn.shopify.com") {
+      return originalUrl;
+    }
+    // Look for "/products/" or "/files/" segment and rebuild as /cdn/shop/<segment>/...
+    const path = u.pathname; // e.g. /s/files/1/1813/5149/products/foo.jpg
+    const idxProducts = path.indexOf("/products/");
+    const idxFiles = path.indexOf("/files/");
+    let rebuilt = null;
+    if (idxProducts !== -1) {
+      rebuilt = `/cdn/shop${path.substring(idxProducts)}${u.search || ""}`;
+    } else if (idxFiles !== -1) {
+      rebuilt = `/cdn/shop${path.substring(idxFiles)}${u.search || ""}`;
+    }
+    if (rebuilt) {
+      return `https://${host}${rebuilt}`;
+    }
+    // Fallback: leave as-is
+    return originalUrl;
+  } catch {
+    return originalUrl;
+  }
 }
 
 function pageUrlForProduct(host, handle, onlineStoreUrl) {
@@ -199,23 +228,22 @@ async function getAllCollectionsWithImage(shop, accessToken) {
   return all;
 }
 
-/* ========== XML builders (strict: only existing alt text, no caption) ========== */
+/* ========== XML builders (with titles + captions, host-pref images) ========== */
 
-function buildImageNode(loc, altText) {
+function buildImageNode(loc, title, caption) {
   return `
-    <image:image>
-      <image:loc>${x(loc)}</image:loc>
-      ${altText ? `<image:title>${x(altText)}</image:title>` : ""}
-    </image:image>`;
+        <image:image>
+          <image:loc>${x(loc)}</image:loc>
+          ${title ? `<image:title>${x(title)}</image:title>` : ""}
+          ${caption ? `<image:caption>${x(caption)}</image:caption>` : ""}
+        </image:image>`;
 }
 
 function buildUrlNode(pageLoc, lastmodISO, imageNodes) {
-  return `
-  <url>
-    <loc>${x(pageLoc)}</loc>
-    ${lastmodISO ? `<lastmod>${x(lastmodISO)}</lastmod>` : ""}
-    ${imageNodes.join("")}
-  </url>`;
+  return `<url>
+      <loc>${x(pageLoc)}</loc>
+      ${lastmodISO ? `<lastmod>${x(lastmodISO)}</lastmod>` : ""}${imageNodes.join("")}
+    </url>`;
 }
 
 /* ========== Main proxy endpoints ========== */
@@ -228,6 +256,8 @@ function buildUrlNode(pageLoc, lastmodISO, imageNodes) {
     - type=products|collections|all  (default: all)
     - page=1..N                      (default: 1)
     - per_page=number                (default: env DEFAULT_PER_PAGE, max MAX_URLS_PER_FEED)
+    - captions=0|1                   (default: 1) include <image:caption> using alt text
+    - prefer_host=0|1                (default: 1) rewrite cdn.shopify.com to https://{host}/cdn/shop/...
 */
 app.get("/image.xml", async (req, res) => {
   try {
@@ -240,9 +270,11 @@ app.get("/image.xml", async (req, res) => {
     const perPageRaw = Math.max(parseInt(req.query.per_page || String(DEFAULT_PER_PAGE), 10), 1);
     const perPage = Math.min(perPageRaw, MAX_URLS_PER_FEED);
     const type = (req.query.type || "all").toLowerCase();
+    const includeCaptions = String(req.query.captions || "1") === "1";
+    const preferHost = String(req.query.prefer_host || "1") === "1";
 
     // cache
-    const key = cacheKey({ route: "image.xml", host, shop, page, perPage, type });
+    const key = cacheKey({ route: "image.xml", host, shop, page, perPage, type, includeCaptions, preferHost });
     const hit = responseCache.get(key);
     const now = Date.now();
     if (hit && hit.expiresAt > now) {
@@ -266,7 +298,12 @@ app.get("/image.xml", async (req, res) => {
         const pageUrl = pageUrlForProduct(host, p.handle, p.onlineStoreUrl);
         const images = (p.images?.edges || []).map((e) => e.node);
         if (!images.length) continue;
-        const imageNodes = images.map((img) => buildImageNode(img.url, img.altText)); // strict alt only
+        const imageNodes = images.map((img) => {
+          const imgUrl = preferHost ? preferHostImageUrl(img.url, host) : img.url;
+          const title = img.altText || ""; // strict: only use existing altText
+          const caption = includeCaptions && img.altText ? img.altText : ""; // use alt as caption too
+          return buildImageNode(imgUrl, title, caption);
+        });
         nodes.push({ lastmod: p.updatedAt, xml: buildUrlNode(pageUrl, p.updatedAt, imageNodes) });
       }
     }
@@ -276,7 +313,10 @@ app.get("/image.xml", async (req, res) => {
       for (const c of collections) {
         if (!c.image?.url) continue;
         const pageUrl = pageUrlForCollection(host, c.handle);
-        const imageNodes = [ buildImageNode(c.image.url, c.image.altText) ]; // strict alt only
+        const imgUrl = preferHost ? preferHostImageUrl(c.image.url, host) : c.image.url;
+        const title = c.image.altText || "";
+        const caption = includeCaptions && c.image.altText ? c.image.altText : "";
+        const imageNodes = [buildImageNode(imgUrl, title, caption)];
         nodes.push({ lastmod: c.updatedAt, xml: buildUrlNode(pageUrl, c.updatedAt, imageNodes) });
       }
     }
@@ -290,9 +330,8 @@ app.get("/image.xml", async (req, res) => {
     const slice = nodes.slice(start, end).map(n => n.xml);
 
     const xml = `<?xml version="1.0" encoding="UTF-8"?>
-<urlset
-  xmlns="http://www.sitemaps.org/schemas/sitemap/0.9"
-  xmlns:image="http://www.google.com/schemas/sitemap-image/1.1">
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9"
+        xmlns:image="http://www.google.com/schemas/sitemap-image/1.1">
 ${slice.join("\n")}
 </urlset>`;
 
