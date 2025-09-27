@@ -5,26 +5,24 @@ import { URL } from "url";
 
 const app = express();
 
-/* ========= CONFIG via ENV =========
-Required (OAuth app installed per shop):
-  APP_API_KEY        -> Client ID (Partner app)
-  APP_API_SECRET     -> API secret key (also App Proxy shared secret for HMAC)
-  HOST               -> Public base URL, e.g. https://image-sitemap-proxy.onrender.com
-  SCOPES             -> e.g. read_products,read_translations
+/* ========= CONFIG via ENV (HYBRID: App Proxy + Custom App Token) =========
+Required:
+  SHOP                -> your admin domain, e.g. smelltoimpress.myshopify.com  (from App B store)
+  ADMIN_API_TOKEN     -> Admin API access token from your Custom App (App B)
+  SHARED_SECRET       -> App Proxy "Shared secret" from Partner App (App A)
 
 Optional:
-  API_VERSION        -> default 2024-04
-  CACHE_TTL_SECONDS  -> default 900 (15m)
-  MAX_URLS_PER_FEED  -> default 5000 (keep < 50k)
-  DEFAULT_PER_PAGE   -> default 200 (safe for proxy timeout)
-  HTTP_TIMEOUT_MS    -> default 12000 (12s per upstream call)
-  TRANS_CONCURRENCY  -> default 8 (translation fetch concurrency)
-=================================== */
+  API_VERSION         -> default 2024-04
+  CACHE_TTL_SECONDS   -> default 900 (15m)
+  MAX_URLS_PER_FEED   -> default 5000 (keep < 50k)
+  DEFAULT_PER_PAGE    -> default 200 (safe for proxy timeouts)
+  HTTP_TIMEOUT_MS     -> default 12000
+  TRANS_CONCURRENCY   -> default 8 (translation fetch concurrency)
+======================================================================== */
 
-const APP_API_KEY = process.env.APP_API_KEY || "";
-const APP_API_SECRET = process.env.APP_API_SECRET || "";
-const HOST = process.env.HOST || "";
-const SCOPES = process.env.SCOPES || "read_products,read_translations";
+const SHOP = process.env.SHOP || "";                  // e.g. smelltoimpress.myshopify.com
+const ADMIN_API_TOKEN = process.env.ADMIN_API_TOKEN || "";
+const SHARED_SECRET = process.env.SHARED_SECRET || "";
 
 const API_VERSION = process.env.API_VERSION || "2024-04";
 const CACHE_TTL_SECONDS = Number(process.env.CACHE_TTL_SECONDS || 900);
@@ -33,13 +31,15 @@ const DEFAULT_PER_PAGE = Math.min(Number(process.env.DEFAULT_PER_PAGE || 200), M
 const HTTP_TIMEOUT_MS = Number(process.env.HTTP_TIMEOUT_MS || 12000);
 const TRANS_CONCURRENCY = Math.max(1, Number(process.env.TRANS_CONCURRENCY || 8));
 
-// In-memory token store per shop (replace with Redis for production)
-const tokenStore = new Map(); // shop => { accessToken, installedAt }
+// quick sanity logs (won't print secrets)
+if (!SHOP) console.error("[startup] Missing SHOP env");
+if (!ADMIN_API_TOKEN) console.error("[startup] Missing ADMIN_API_TOKEN env");
+if (!SHARED_SECRET) console.error("[startup] Missing SHARED_SECRET env");
 
 // Simple in-memory response cache
 const responseCache = new Map(); // key => { body, expiresAt }
 
-/* ========== Small utils ========== */
+/* ======================== Utilities ======================== */
 
 function cacheKey(parts) {
   return Object.entries(parts).map(([k,v]) => `${k}=${v}`).sort().join("|");
@@ -85,15 +85,16 @@ function pageUrlForCollection(host, handle) {
   return `https://${h}/collections/${handle}`;
 }
 
+// Verify Shopify App Proxy signature (from App A)
 function verifyProxyHmac(req) {
   const { signature, ...params } = req.query;
-  if (!APP_API_SECRET || !signature) return false;
+  if (!SHARED_SECRET || !signature) return false;
   const sorted = Object.keys(params).sort().map(k => `${k}=${params[k]}`).join("");
-  const digest = crypto.createHmac("sha256", APP_API_SECRET).update(sorted).digest("hex");
+  const digest = crypto.createHmac("sha256", SHARED_SECRET).update(sorted).digest("hex");
   return signature === digest;
 }
 
-// Map host → Shopify locale code
+// locale mapping by host (override via ?locale=)
 function getLocaleForHost(host, override) {
   if (override) return override.toLowerCase();
   const h = (host || "").toLowerCase();
@@ -114,7 +115,7 @@ function numericIdFromGid(gid) {
   return parts.length ? parts[parts.length - 1] : null;
 }
 
-// node-fetch with timeout
+// timed fetch
 async function timedFetch(url, opts = {}, timeoutMs = HTTP_TIMEOUT_MS) {
   const controller = new AbortController();
   const t = setTimeout(() => controller.abort(), timeoutMs);
@@ -126,7 +127,7 @@ async function timedFetch(url, opts = {}, timeoutMs = HTTP_TIMEOUT_MS) {
   }
 }
 
-// Simple concurrency limiter
+// concurrency limiter
 async function pMap(items, limit, mapper) {
   const ret = [];
   const executing = [];
@@ -144,84 +145,18 @@ async function pMap(items, limit, mapper) {
   return Promise.all(ret);
 }
 
-/* ===== NEW helpers for translated fallbacks (points 1 & 2) ===== */
-function extractTranslatedValue(translations, keyExact) {
-  if (!translations) return "";
-  for (const t of translations) {
-    if (t.key === keyExact && t.value) return String(t.value);
-  }
-  return "";
-}
-function buildImageAltMapFromTranslations(translations) {
-  const map = new Map(); // "*" or "<numericImageId>" -> altText
-  if (!translations) return map;
-  for (const t of translations) {
-    if (!t?.key || !t?.value) continue;
-    if (t.key === "image.alt_text") {
-      map.set("*", String(t.value));
-      continue;
-    }
-    const m = t.key.match(/^image\[(\d+)\]\.alt$/i);
-    if (m) map.set(m[1], String(t.value));
-  }
-  return map;
-}
+/* ================= Shopify Admin fetchers ================= */
 
-/* ========== OAuth (public app) minimal flow ========== */
-app.get("/auth", (req, res) => {
-  const shop = String(req.query.shop || "");
-  if (!shop || !shop.endsWith(".myshopify.com")) {
-    return res.status(400).send("Missing/invalid shop");
-  }
-  const state = crypto.randomBytes(12).toString("hex");
-  const redirectUri = `${HOST}/auth/callback`;
-  const url = `https://${shop}/admin/oauth/authorize?client_id=${APP_API_KEY}` +
-              `&scope=${encodeURIComponent(SCOPES)}` +
-              `&redirect_uri=${encodeURIComponent(redirectUri)}` +
-              `&state=${state}`;
-  res.redirect(url);
-});
-
-app.get("/auth/callback", async (req, res) => {
-  try {
-    const { shop, code } = req.query;
-    if (!shop || !code) return res.status(400).send("Missing shop/code");
-    const tokenResp = await timedFetch(`https://${shop}/admin/oauth/access_token`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        client_id: APP_API_KEY,
-        client_secret: APP_API_SECRET,
-        code
-      })
-    });
-    if (!tokenResp.ok) {
-      const t = await tokenResp.text();
-      return res.status(400).send(`Token exchange failed: ${t}`);
-    }
-    const json = await tokenResp.json();
-    tokenStore.set(shop, { accessToken: json.access_token, installedAt: Date.now() });
-    res
-      .type("text/plain")
-      .send(`Installed for ${shop}. Token stored in memory. You can now hit your App Proxy: https://${stripPort(req.get("host"))}/apps/sitemaps/image.xml`);
-  } catch (err) {
-    console.error(err);
-    res.status(500).send("OAuth error");
-  }
-});
-
-/* ========== Admin API fetchers (cursor-only page slice) ========== */
-
-// GraphQL paged fetcher helper
-async function gqlPagedSlice({ shop, token, query, selectEdges, first, offset, take }) {
+// GraphQL paged fetcher helper: returns a slice (offset/take) without pulling everything
+async function gqlPagedSlice({ query, selectEdges, first, offset, take }) {
   let after = null;
   let skipped = 0;
   const out = [];
   while (out.length < take) {
-    const resp = await timedFetch(`https://${shop}/admin/api/${API_VERSION}/graphql.json`, {
+    const resp = await timedFetch(`https://${SHOP}/admin/api/${API_VERSION}/graphql.json`, {
       method: "POST",
       headers: {
-        "X-Shopify-Access-Token": token,
+        "X-Shopify-Access-Token": ADMIN_API_TOKEN,
         "Content-Type": "application/json",
       },
       body: JSON.stringify({ query, variables: { first, after } }),
@@ -253,7 +188,7 @@ async function gqlPagedSlice({ shop, token, query, selectEdges, first, offset, t
   return out;
 }
 
-async function getProductsSlice(shop, token, offset, limit) {
+async function getProductsSlice(offset, limit) {
   const query = `
     query Products($first:Int!, $after:String) {
       products(first:$first, after:$after, query:"status:active", sortKey:UPDATED_AT, reverse:true) {
@@ -275,8 +210,6 @@ async function getProductsSlice(shop, token, offset, limit) {
     }
   `;
   return gqlPagedSlice({
-    shop,
-    token,
     query,
     selectEdges: (j) => j?.data?.products?.edges,
     first: 100,
@@ -285,7 +218,7 @@ async function getProductsSlice(shop, token, offset, limit) {
   });
 }
 
-async function getCollectionsSlice(shop, token, offset, limit) {
+async function getCollectionsSlice(offset, limit) {
   const query = `
     query Collections($first:Int!, $after:String) {
       collections(first:$first, after:$after, query:"published_status:published", sortKey:UPDATED_AT, reverse:true) {
@@ -304,8 +237,6 @@ async function getCollectionsSlice(shop, token, offset, limit) {
     }
   `;
   return gqlPagedSlice({
-    shop,
-    token,
     query,
     selectEdges: (j) => j?.data?.collections?.edges,
     first: 200,
@@ -314,29 +245,54 @@ async function getCollectionsSlice(shop, token, offset, limit) {
   });
 }
 
-/* ========== Admin REST Translations (slice-only, with concurrency cap) ========== */
+/* ===== Translations via Admin REST (needs read_translations) ===== */
 
-async function fetchProductTranslations(shop, token, numericId, locale) {
-  const url = `https://${shop}/admin/api/${API_VERSION}/translations.json?locale=${encodeURIComponent(locale)}&resource_type=Product&resource_id=${numericId}`;
+async function fetchProductTranslations(numericId, locale) {
+  const url = `https://${SHOP}/admin/api/${API_VERSION}/translations.json?locale=${encodeURIComponent(locale)}&resource_type=Product&resource_id=${numericId}`;
   const resp = await timedFetch(url, {
-    headers: { "X-Shopify-Access-Token": token, "Content-Type": "application/json" }
+    headers: { "X-Shopify-Access-Token": ADMIN_API_TOKEN, "Content-Type": "application/json" }
   });
   if (!resp.ok) return null;
   const json = await resp.json();
   return json?.translations || null;
 }
 
-async function fetchCollectionTranslations(shop, token, numericId, locale) {
-  const url = `https://${shop}/admin/api/${API_VERSION}/translations.json?locale=${encodeURIComponent(locale)}&resource_type=Collection&resource_id=${numericId}`;
+async function fetchCollectionTranslations(numericId, locale) {
+  const url = `https://${SHOP}/admin/api/${API_VERSION}/translations.json?locale=${encodeURIComponent(locale)}&resource_type=Collection&resource_id=${numericId}`;
   const resp = await timedFetch(url, {
-    headers: { "X-Shopify-Access-Token": token, "Content-Type": "application/json" }
+    headers: { "X-Shopify-Access-Token": ADMIN_API_TOKEN, "Content-Type": "application/json" }
   });
   if (!resp.ok) return null;
   const json = await resp.json();
   return json?.translations || null;
 }
 
-/* ========== XML builders ========== */
+/* ===== Helpers for translated fallbacks ===== */
+
+function extractTranslatedValue(translations, keyExact) {
+  if (!translations) return "";
+  for (const t of translations) {
+    if (t.key === keyExact && t.value) return String(t.value);
+  }
+  return "";
+}
+
+function buildImageAltMapFromTranslations(translations) {
+  const map = new Map(); // "*" or "<numericImageId>" -> altText
+  if (!translations) return map;
+  for (const t of translations) {
+    if (!t?.key || !t?.value) continue;
+    if (t.key === "image.alt_text") {
+      map.set("*", String(t.value));
+      continue;
+    }
+    const m = t.key.match(/^image\[(\d+)\]\.alt$/i);
+    if (m) map.set(m[1], String(t.value));
+  }
+  return map;
+}
+
+/* ================= XML builders ================= */
 
 function buildImageNode(loc, title, caption) {
   return `
@@ -354,14 +310,16 @@ function buildUrlNode(pageLoc, lastmodISO, imageNodes) {
     </url>`;
 }
 
-/* ========== Main proxy endpoints ========== */
+/* ================= Main endpoints (App Proxy) ================= */
+
+// Image sitemap (products | collections | all)
 app.get("/image.xml", async (req, res) => {
   try {
     if (!verifyProxyHmac(req)) return res.status(401).send("Invalid signature");
 
     const forwardedHost = req.get("x-forwarded-host") || req.get("host");
     const host = stripPort(forwardedHost);
-    const shop = String(req.query.shop || "");
+
     const page = Math.max(parseInt(req.query.page || "1", 10), 1);
     const perPageRaw = Math.max(parseInt(req.query.per_page || String(DEFAULT_PER_PAGE), 10), 1);
     const perPage = Math.min(perPageRaw, MAX_URLS_PER_FEED);
@@ -372,7 +330,7 @@ app.get("/image.xml", async (req, res) => {
     const debug = String(req.query.debug || "0") === "1";
 
     // cache
-    const key = cacheKey({ route: "image.xml", host, shop, page, perPage, type, includeCaptions, preferHost, locale });
+    const key = cacheKey({ route: "image.xml", host, page, perPage, type, includeCaptions, preferHost, locale });
     const hit = responseCache.get(key);
     const now = Date.now();
     if (hit && hit.expiresAt > now) {
@@ -380,29 +338,20 @@ app.get("/image.xml", async (req, res) => {
       return res.status(200).send(hit.body);
     }
 
-    const tokenEntry = tokenStore.get(shop);
-    if (!tokenEntry?.accessToken) {
-      return res
-        .status(403)
-        .type("text/plain")
-        .send(`App not installed for ${shop}. Visit ${HOST}/auth?shop=${shop}`);
-    }
-    const accessToken = tokenEntry.accessToken;
-
     const offset = (page - 1) * perPage;
     const nodes = [];
 
-    // PRODUCTS
+    // --- PRODUCTS ---
     if (type === "products" || type === "all") {
-      const products = await getProductsSlice(shop, accessToken, offset, perPage);
+      const products = await getProductsSlice(offset, perPage);
 
-      // translations for this slice
+      // fetch translations for this slice concurrently
       const prodTrans = await pMap(
         products.map(p => ({ p, idNum: numericIdFromGid(p.id) })),
         TRANS_CONCURRENCY,
         async ({ p, idNum }) => {
           let trs = null;
-          if (idNum) trs = await fetchProductTranslations(shop, accessToken, idNum, locale);
+          if (idNum) trs = await fetchProductTranslations(idNum, locale);
           return { id: p.id, trs };
         }
       );
@@ -422,7 +371,7 @@ app.get("/image.xml", async (req, res) => {
           const translatedAlt =
             (imgIdNum && imageAltMap.get(imgIdNum)) ||
             imageAltMap.get("*") ||
-            ""; // no EN fallback
+            ""; // strict: no EN fallback
 
           const resolved = translatedAlt || productTitleTr || "";
           const imgUrl = preferHost ? preferHostImageUrl(img.url, host) : img.url;
@@ -437,16 +386,16 @@ app.get("/image.xml", async (req, res) => {
       }
     }
 
-    // COLLECTIONS
+    // --- COLLECTIONS ---
     if (type === "collections" || type === "all") {
-      const collections = await getCollectionsSlice(shop, accessToken, offset, perPage);
+      const collections = await getCollectionsSlice(offset, perPage);
 
       const colTrans = await pMap(
         collections.map(c => ({ c, idNum: numericIdFromGid(c.id) })),
         TRANS_CONCURRENCY,
         async ({ c, idNum }) => {
           let trs = null;
-          if (idNum) trs = await fetchCollectionTranslations(shop, accessToken, idNum, locale);
+          if (idNum) trs = await fetchCollectionTranslations(idNum, locale);
           return { id: c.id, trs };
         }
       );
@@ -458,9 +407,9 @@ app.get("/image.xml", async (req, res) => {
 
         const trs = transMap.get(c.id) || [];
         const collectionTitleTr = extractTranslatedValue(trs, "title") || "";
-        const imgIdNum = numericIdFromGid(c.image?.id);
 
-        // image alt translation (specific image or global)
+        // Resolve translated alt for this collection image
+        const imgIdNum = numericIdFromGid(c.image?.id);
         let imageAltTr = "";
         for (const t of trs) {
           if (!t?.key || !t?.value) continue;
@@ -499,21 +448,17 @@ ${nodes.join("\n")}
   }
 });
 
-// Sanity check
-app.get("/echo", (_req, res) => res.type("text/plain").send("echo ok"));
-
-/* Optional: lightweight index */
+// Simple index helper
 app.get("/image-index.xml", (req, res) => {
   const forwardedHost = req.get("x-forwarded-host") || req.get("host");
   const host = stripPort(forwardedHost);
-  const shop = String(req.query.shop || "");
   const pages = Number(req.query.pages || 5);
   const type = String(req.query.type || "products");
   const perPage = Number(req.query.per_page || DEFAULT_PER_PAGE);
   const locale = req.query.locale ? `&locale=${encodeURIComponent(req.query.locale)}` : "";
 
   const urls = Array.from({ length: pages }, (_, i) => i + 1).map(
-    (n) => `<sitemap><loc>https://${host}/apps/sitemaps/image.xml?shop=${shop}&type=${encodeURIComponent(type)}&page=${n}&per_page=${perPage}${locale}</loc></sitemap>`
+    (n) => `<sitemap><loc>https://${host}/apps/sitemaps/image.xml?type=${encodeURIComponent(type)}&page=${n}&per_page=${perPage}${locale}</loc></sitemap>`
   );
 
   const xml = `<?xml version="1.0" encoding="UTF-8"?>
@@ -525,13 +470,12 @@ ${urls.join("\n")}
   return res.status(200).send(xml);
 });
 
-/* Health & root */
+// Health & root
 app.get("/health", (_req, res) => res.type("text/plain").send("ok"));
-app.get("/", (_req, res) => {
-  res
-    .type("text/plain")
-    .send("Image Sitemap Proxy is running. Use /health, /echo, or call via Shopify App Proxy at /apps/sitemaps/image.xml");
-});
+app.get("/", (_req, res) =>
+  res.type("text/plain").send("Image Sitemap Proxy (hybrid) running. Use /health, or call via Shopify App Proxy at /apps/sitemaps/image.xml")
+);
 
 const port = process.env.PORT || 3000;
-app.listen(port, () => console.log(`Image sitemap proxy on :${port}`));
+app.listen(port, () => console.log(`Image sitemap proxy (hybrid) on :${port}`));
+
