@@ -237,6 +237,7 @@ ${slice.join("\n")}
 });
 
 /* ========== Optional: index for paginated feeds ========== */
+app.get("/echo", (req,res)=>res.type("text/plain").send("echo ok"));
 app.get("/image-index.xml", (req, res) => {
   const host = stripPort(req.get("x-forwarded-host") || req.get("host"));
   const urls = Array.from({ length: 5 }, (_, i) => i + 1).map(
