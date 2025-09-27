@@ -9,7 +9,7 @@ const app = express();
 Required:
   SHOP                -> e.g. smelltoimpress.myshopify.com
   ADMIN_API_TOKEN     -> Admin API token from your Custom App (read_products, read_translations)
-  SHARED_SECRET       -> App Proxy "Shared secret" from Partner App
+  SHARED_SECRET       -> App Proxy "API secret key" from the Partner App WITH the App Proxy
 
 Optional:
   API_VERSION         -> default 2024-04
@@ -18,11 +18,13 @@ Optional:
   DEFAULT_PER_PAGE    -> default 200
   HTTP_TIMEOUT_MS     -> default 12000
   TRANS_CONCURRENCY   -> default 8
+  DISABLE_HMAC        -> "1" to bypass proxy HMAC check (for local testing only)
 ============================================= */
 
 const SHOP = process.env.SHOP || "";
 const ADMIN_API_TOKEN = process.env.ADMIN_API_TOKEN || "";
 const SHARED_SECRET = process.env.SHARED_SECRET || "";
+const DISABLE_HMAC = String(process.env.DISABLE_HMAC || "0") === "1";
 
 const API_VERSION = process.env.API_VERSION || "2024-04";
 const CACHE_TTL_SECONDS = Number(process.env.CACHE_TTL_SECONDS || 900);
@@ -64,13 +66,37 @@ function pageUrlForCollection(host, handle){
   const h=stripPort(host);
   return `https://${h}/collections/${handle}`;
 }
+
+/** Hardened App Proxy HMAC check (Shopify signs the sorted query-string sans signature) */
 function verifyProxyHmac(req){
-  const { signature, ...params }=req.query;
-  if(!SHARED_SECRET||!signature) return false;
-  const sorted=Object.keys(params).sort().map(k=>`${k}=${params[k]}`).join("");
-  const digest=crypto.createHmac("sha256",SHARED_SECRET).update(sorted).digest("hex");
-  return signature===digest;
+  if (DISABLE_HMAC) return true; // for local testing only
+  const query = { ...req.query };
+  const provided = (query.signature || query.sig || "").toString().toLowerCase();
+  delete query.signature;
+  delete query.sig;
+
+  if (!SHARED_SECRET || !provided) return false;
+
+  const payload = Object.keys(query)
+    .sort()
+    .map(k => `${k}=${query[k]}`)
+    .join("");
+
+  const expected = crypto
+    .createHmac("sha256", SHARED_SECRET)
+    .update(payload)
+    .digest("hex")
+    .toLowerCase();
+
+  try {
+    const a = Buffer.from(expected, "hex");
+    const b = Buffer.from(provided, "hex");
+    return a.length === b.length && crypto.timingSafeEqual(a, b);
+  } catch {
+    return false;
+  }
 }
+
 function getLocaleForHost(host, override){
   if(override) return override.toLowerCase();
   const h=(host||"").toLowerCase();
@@ -272,13 +298,12 @@ app.get("/image.xml", async (req,res)=>{
         const trs=transMap.get(p.id)||[];
         const productTitleTr=extractTranslatedValue(trs,"title");
         const imageAltMap=buildImageAltMapFromTranslations(trs);
-
         const productTitleFallback = productTitleTr || p.title || "";
 
         const imageNodes = images.map(img=>{
           const imgIdNum=numericIdFromGid(img.id);
           const translatedAlt = (imgIdNum && imageAltMap.get(imgIdNum)) || imageAltMap.get("*") || "";
-          const resolved = translatedAlt || productTitleFallback; // <-- now always has a value
+          const resolved = translatedAlt || productTitleFallback; // caption + title from FR alt or FR title
           const imgUrl = preferHost ? preferHostImageUrl(img.url, host) : img.url;
           return buildImageNode(imgUrl, resolved, resolved);
         });
@@ -318,7 +343,7 @@ app.get("/image.xml", async (req,res)=>{
           if(m && imgIdNum && m[1]===String(imgIdNum)) imageAltTr=String(t.value);
         }
 
-        const resolved = imageAltTr || collectionTitleTr || c.title || ""; // <-- fallback to collection title
+        const resolved = imageAltTr || collectionTitleTr || c.title || "";
         const imgUrl = preferHost ? preferHostImageUrl(c.image.url, host) : c.image.url;
         const imageNodes=[buildImageNode(imgUrl, resolved, resolved)];
 
@@ -342,6 +367,27 @@ ${nodes.join("\n")}
     console.error(e);
     return res.status(500).send("Sitemap generation error");
   }
+});
+
+/** Proxy signature debugger (temporary / secure as needed) */
+app.get("/proxy-debug", (req, res) => {
+  const q = { ...req.query };
+  const given = (q.signature || q.sig || "").toString().toLowerCase();
+  delete q.signature; delete q.sig;
+  const payload = Object.keys(q).sort().map(k => `${k}=${q[k]}`).join("");
+  const expected = SHARED_SECRET
+    ? crypto.createHmac("sha256", SHARED_SECRET).update(payload).digest("hex").toLowerCase()
+    : "(SHARED_SECRET MISSING)";
+  res.type("text/plain").send(
+    [
+      `host: ${req.get("host")}`,
+      `path: ${req.path}`,
+      `payload: ${payload}`,
+      `expected signature: ${expected}`,
+      `given signature:    ${given}`,
+      `match: ${expected === given}`,
+    ].join("\n")
+  );
 });
 
 // Optional index
@@ -370,4 +416,5 @@ app.get("/",(_req,res)=>res.type("text/plain").send("Image Sitemap Proxy (hybrid
 
 const port=process.env.PORT||3000;
 app.listen(port,()=>console.log(`Image sitemap proxy (hybrid) on :${port}`));
+
 
