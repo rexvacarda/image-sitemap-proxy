@@ -172,7 +172,7 @@ function buildUrlNode(pageLoc, imageNodes) {
     - type=products|collections|all (default: all)
     - page=1..N (simple pagination after combining URLs)
 */
-app.get("/apps/sitemaps/image.xml", async (req, res) => {
+app.get("/image.xml", async (req, res) => {
   try {
     if (!verifyAppProxy(req)) return res.status(401).send("Invalid signature");
 
@@ -230,7 +230,7 @@ ${slice.join("\n")}
   You could first compute total count and number of pages; for simplicity,
   this static example lists first 5 pages for 'all' type.
 */
-app.get("/apps/sitemaps/image-index.xml", (req, res) => {
+app.get("/image-index.xml", (req, res) => {
   const host = stripPort(req.get("x-forwarded-host") || req.get("host"));
   const urls = Array.from({ length: 5 }, (_, i) => i + 1).map(
     (n) => `<sitemap><loc>https://${host}/apps/sitemaps/image.xml?type=all&page=${n}</loc></sitemap>`
