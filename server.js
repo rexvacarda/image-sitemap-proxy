@@ -144,6 +144,29 @@ async function pMap(items, limit, mapper) {
   return Promise.all(ret);
 }
 
+/* ===== NEW helpers for translated fallbacks (points 1 & 2) ===== */
+function extractTranslatedValue(translations, keyExact) {
+  if (!translations) return "";
+  for (const t of translations) {
+    if (t.key === keyExact && t.value) return String(t.value);
+  }
+  return "";
+}
+function buildImageAltMapFromTranslations(translations) {
+  const map = new Map(); // "*" or "<numericImageId>" -> altText
+  if (!translations) return map;
+  for (const t of translations) {
+    if (!t?.key || !t?.value) continue;
+    if (t.key === "image.alt_text") {
+      map.set("*", String(t.value));
+      continue;
+    }
+    const m = t.key.match(/^image\[(\d+)\]\.alt$/i);
+    if (m) map.set(m[1], String(t.value));
+  }
+  return map;
+}
+
 /* ========== OAuth (public app) minimal flow ========== */
 app.get("/auth", (req, res) => {
   const shop = String(req.query.shop || "");
@@ -346,6 +369,7 @@ app.get("/image.xml", async (req, res) => {
     const includeCaptions = String(req.query.captions || "1") === "1";
     const preferHost = String(req.query.prefer_host || "1") === "1";
     const locale = getLocaleForHost(host, req.query.locale);
+    const debug = String(req.query.debug || "0") === "1";
 
     // cache
     const key = cacheKey({ route: "image.xml", host, shop, page, perPage, type, includeCaptions, preferHost, locale });
@@ -368,10 +392,11 @@ app.get("/image.xml", async (req, res) => {
     const offset = (page - 1) * perPage;
     const nodes = [];
 
-    // Fetch just the slice you need (newest first already)
+    // PRODUCTS
     if (type === "products" || type === "all") {
       const products = await getProductsSlice(shop, accessToken, offset, perPage);
-      // Fetch translations for this slice with concurrency limit
+
+      // translations for this slice
       const prodTrans = await pMap(
         products.map(p => ({ p, idNum: numericIdFromGid(p.id) })),
         TRANS_CONCURRENCY,
@@ -388,21 +413,23 @@ app.get("/image.xml", async (req, res) => {
         const images = (p.images?.edges || []).map((e) => e.node);
         if (!images.length) continue;
 
-        // Build translated alts from trs
         const trs = transMap.get(p.id) || [];
-        const imageAltMap = new Map(); // by numeric image id or "*" (global)
-        for (const t of trs) {
-          if (t.key === "image.alt_text" && t.value) imageAltMap.set("*", t.value);
-          const m = t.key && t.key.match(/^image\[(\d+)\]\.alt$/i);
-          if (m && t.value) imageAltMap.set(m[1], t.value);
-        }
+        const productTitleTr = extractTranslatedValue(trs, "title") || "";
+        const imageAltMap = buildImageAltMapFromTranslations(trs);
 
         const imageNodes = images.map((img) => {
           const imgIdNum = numericIdFromGid(img.id);
-          const translatedAlt = (imgIdNum && imageAltMap.get(imgIdNum)) || imageAltMap.get("*") || img.altText || "";
+          const translatedAlt =
+            (imgIdNum && imageAltMap.get(imgIdNum)) ||
+            imageAltMap.get("*") ||
+            ""; // no EN fallback
+
+          const resolved = translatedAlt || productTitleTr || "";
           const imgUrl = preferHost ? preferHostImageUrl(img.url, host) : img.url;
-          const title = translatedAlt || ""; // strict: no EN fallback
-          const caption = includeCaptions && translatedAlt ? translatedAlt : "";
+
+          const title = resolved ? resolved : "";
+          const caption = includeCaptions && resolved ? resolved : "";
+
           return buildImageNode(imgUrl, title, caption);
         });
 
@@ -410,8 +437,10 @@ app.get("/image.xml", async (req, res) => {
       }
     }
 
+    // COLLECTIONS
     if (type === "collections" || type === "all") {
       const collections = await getCollectionsSlice(shop, accessToken, offset, perPage);
+
       const colTrans = await pMap(
         collections.map(c => ({ c, idNum: numericIdFromGid(c.id) })),
         TRANS_CONCURRENCY,
@@ -428,24 +457,34 @@ app.get("/image.xml", async (req, res) => {
         const pageUrl = pageUrlForCollection(host, c.handle);
 
         const trs = transMap.get(c.id) || [];
-        let imageAlt = c.image?.altText || "";
+        const collectionTitleTr = extractTranslatedValue(trs, "title") || "";
+        const imgIdNum = numericIdFromGid(c.image?.id);
+
+        // image alt translation (specific image or global)
+        let imageAltTr = "";
         for (const t of trs) {
-          if (t.key === "image.alt_text" && t.value) imageAlt = t.value;
-          const m = t.key && t.key.match(/^image\[(\d+)\]\.alt$/i);
-          const imgIdNum = numericIdFromGid(c.image?.id);
-          if (m && imgIdNum && m[1] === String(imgIdNum) && t.value) imageAlt = t.value;
+          if (!t?.key || !t?.value) continue;
+          if (t.key === "image.alt_text") imageAltTr = String(t.value);
+          const m = t.key.match(/^image\[(\d+)\]\.alt$/i);
+          if (m && imgIdNum && m[1] === String(imgIdNum)) imageAltTr = String(t.value);
         }
 
+        const resolved = imageAltTr || collectionTitleTr || "";
         const imgUrl = preferHost ? preferHostImageUrl(c.image.url, host) : c.image.url;
-        const title = imageAlt || "";
-        const caption = includeCaptions && imageAlt ? imageAlt : "";
+
+        const title = resolved ? resolved : "";
+        const caption = includeCaptions && resolved ? resolved : "";
         const imageNodes = [buildImageNode(imgUrl, title, caption)];
 
         nodes.push(buildUrlNode(pageUrl, c.updatedAt, imageNodes));
       }
     }
 
-    const xml = `<?xml version="1.0" encoding="UTF-8"?>
+    const debugComment = debug
+      ? `\n<!-- locale=${locale} host=${host} type=${type} page=${page} per_page=${perPage} -->\n`
+      : "";
+
+    const xml = `<?xml version="1.0" encoding="UTF-8"?>${debugComment}
 <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9"
         xmlns:image="http://www.google.com/schemas/sitemap-image/1.1">
 ${nodes.join("\n")}
