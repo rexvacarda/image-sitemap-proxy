@@ -5,37 +5,40 @@ import crypto from "crypto";
 const app = express();
 
 /* ========= CONFIG via ENV =========
-REQUIRED (Partner/Dev app with OAuth):
-  APP_API_KEY         -> From Shopify app "API credentials" (Client ID)
-  APP_API_SECRET      -> From Shopify app "API credentials" (Client secret)
-  SCOPES              -> e.g. "read_products,read_collections"
-  HOST                -> Your public app URL (https://image-sitemap-proxy.onrender.com)
+Required (OAuth app installed per shop):
+  APP_API_KEY        -> Client ID from Partner app (used by OAuth routes)
+  APP_API_SECRET     -> API secret key (also App Proxy shared secret for HMAC)
+  HOST               -> Public base URL of this server, e.g. https://image-sitemap-proxy.onrender.com
+  SCOPES             -> e.g. read_products,read_collections
 
-OPTIONAL:
-  API_VERSION         -> e.g. 2024-04 (default)
-  CACHE_TTL_SECONDS   -> e.g. 3600 (1h)
-  MAX_URLS_PER_FEED   -> e.g. 45000 (keep < 50k)
+Optional:
+  API_VERSION        -> Admin API version, default 2024-04
+  CACHE_TTL_SECONDS  -> default 900 (15m)
+  MAX_URLS_PER_FEED  -> default 5000 (keep < 50k)
+  DEFAULT_PER_PAGE   -> default 1000 (capped to MAX_URLS_PER_FEED)
 =================================== */
 
-const APP_API_KEY = process.env.APP_API_KEY;
-const APP_API_SECRET = process.env.APP_API_SECRET;
+const APP_API_KEY = process.env.APP_API_KEY || "";
+const APP_API_SECRET = process.env.APP_API_SECRET || "";
+const HOST = process.env.HOST || "";
 const SCOPES = process.env.SCOPES || "read_products,read_collections";
-const HOST = process.env.HOST; // e.g., https://image-sitemap-proxy.onrender.com
+
 const API_VERSION = process.env.API_VERSION || "2024-04";
-const CACHE_TTL_SECONDS = Number(process.env.CACHE_TTL_SECONDS || 3600);
-const MAX_URLS_PER_FEED = Number(process.env.MAX_URLS_PER_FEED || 45000);
+const CACHE_TTL_SECONDS = Number(process.env.CACHE_TTL_SECONDS || 900);
+const MAX_URLS_PER_FEED = Number(process.env.MAX_URLS_PER_FEED || 5000);
+const DEFAULT_PER_PAGE = Math.min(Number(process.env.DEFAULT_PER_PAGE || 1000), MAX_URLS_PER_FEED);
 
-if (!APP_API_KEY || !APP_API_SECRET || !HOST) {
-  console.warn("[startup] Missing APP_API_KEY / APP_API_SECRET / HOST envs.");
-}
+// In-memory token store per shop (replace with Redis for production)
+const tokenStore = new Map(); // shop => { accessToken, installedAt }
 
-/** ======================================================================
- * Simple in-memory token store (shop -> access_token).
- * Replace with Redis/DB for production multi-instance reliability.
- * ====================================================================== */
-const tokenStore = new Map();
+// Simple in-memory response cache
+const responseCache = new Map(); // key => { body, expiresAt }
 
 /* ========== Helpers ========== */
+
+function cacheKey(parts) {
+  return Object.entries(parts).map(([k,v]) => `${k}=${v}`).sort().join("|");
+}
 
 function setXmlHeaders(res) {
   res.set("Content-Type", "application/xml; charset=utf-8");
@@ -61,50 +64,59 @@ function pageUrlForCollection(host, handle) {
   return `https://${h}/collections/${handle}`;
 }
 
-/** =====================================================
- * App Proxy signature verification
- * Shopify App Proxy adds ?shop & ?signature.
- * The signature is HMAC-SHA256 of the sorted query string
- * without the signature itself, using APP_API_SECRET.
- * ===================================================== */
-function verifyAppProxy(req) {
+function verifyProxyHmac(req) {
+  // Shopify App Proxy sends all query params plus `signature` (hex HMAC-SHA256)
   const { signature, ...params } = req.query;
-  if (!signature) return false;
-  const sorted = Object.keys(params)
-    .sort()
-    .map((k) => `${k}=${params[k]}`)
-    .join("");
+  if (!APP_API_SECRET || !signature) return false;
+  const sorted = Object.keys(params).sort().map(k => `${k}=${params[k]}`).join("");
   const digest = crypto.createHmac("sha256", APP_API_SECRET).update(sorted).digest("hex");
   return signature === digest;
 }
 
-/** =============================================
- * OAuth helpers
- * ============================================= */
-function buildInstallUrl(shop) {
-  const redirectUri = `${HOST.replace(/\/$/, "")}/auth/callback`;
-  const state = crypto.randomBytes(16).toString("hex");
-  const url = new URL(`https://${shop}/admin/oauth/authorize`);
-  url.searchParams.set("client_id", APP_API_KEY);
-  url.searchParams.set("scope", SCOPES);
-  url.searchParams.set("redirect_uri", redirectUri);
-  url.searchParams.set("state", state);
-  return { url: url.toString(), state };
-}
+/* ========== OAuth (public app) minimal flow ========== */
+app.get("/auth", (req, res) => {
+  const shop = String(req.query.shop || "");
+  if (!shop || !shop.endsWith(".myshopify.com")) {
+    return res.status(400).send("Missing/invalid shop");
+  }
+  const state = crypto.randomBytes(12).toString("hex");
+  const redirectUri = `${HOST}/auth/callback`;
+  const url = `https://${shop}/admin/oauth/authorize?client_id=${APP_API_KEY}` +
+              `&scope=${encodeURIComponent(SCOPES)}` +
+              `&redirect_uri=${encodeURIComponent(redirectUri)}` +
+              `&state=${state}`;
+  res.redirect(url);
+});
 
-function verifyHmacFromQuery(query) {
-  // For OAuth callback (uses 'hmac' param)
-  const { hmac, signature, ...rest } = query;
-  if (!hmac) return false;
-  const message = Object.keys(rest)
-    .sort()
-    .map((k) => `${k}=${rest[k]}`)
-    .join("&");
-  const digest = crypto.createHmac("sha256", APP_API_SECRET).update(message).digest("hex");
-  return crypto.timingSafeEqual(Buffer.from(digest, "utf8"), Buffer.from(hmac, "utf8"));
-}
+app.get("/auth/callback", async (req, res) => {
+  try {
+    const { shop, code } = req.query;
+    if (!shop || !code) return res.status(400).send("Missing shop/code");
+    const tokenResp = await fetch(`https://${shop}/admin/oauth/access_token`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        client_id: APP_API_KEY,
+        client_secret: APP_API_SECRET,
+        code
+      })
+    });
+    if (!tokenResp.ok) {
+      const t = await tokenResp.text();
+      return res.status(400).send(`Token exchange failed: ${t}`);
+    }
+    const json = await tokenResp.json();
+    tokenStore.set(shop, { accessToken: json.access_token, installedAt: Date.now() });
+    res
+      .type("text/plain")
+      .send(`Installed for ${shop}. Token stored in memory. You can now hit your App Proxy: https://${stripPort(req.get("host"))}/apps/sitemaps/image.xml`);
+  } catch (err) {
+    console.error(err);
+    res.status(500).send("OAuth error");
+  }
+});
 
-/* ========== Shopify Admin GraphQL fetchers (per-shop access token) ========== */
+/* ========== Admin API fetchers (use per-shop token) ========== */
 
 async function shopifyGraphQL(shop, accessToken, query, variables = {}) {
   const resp = await fetch(`https://${shop}/admin/api/${API_VERSION}/graphql.json`, {
@@ -129,9 +141,11 @@ async function getAllProductsWithImages(shop, accessToken) {
         edges {
           cursor
           node {
+            id
             title
             handle
             onlineStoreUrl
+            updatedAt
             images(first:50) {
               edges { node { url altText } }
             }
@@ -141,11 +155,9 @@ async function getAllProductsWithImages(shop, accessToken) {
       }
     }
   `;
-
   const all = [];
   let after = null;
   let hasNext = true;
-
   while (hasNext) {
     const data = await shopifyGraphQL(shop, accessToken, query, { first: 100, after });
     const edges = data?.data?.products?.edges || [];
@@ -163,8 +175,10 @@ async function getAllCollectionsWithImage(shop, accessToken) {
         edges {
           cursor
           node {
+            id
             title
             handle
+            updatedAt
             image { url altText }
           }
         }
@@ -172,11 +186,9 @@ async function getAllCollectionsWithImage(shop, accessToken) {
       }
     }
   `;
-
   const all = [];
   let after = null;
   let hasNext = true;
-
   while (hasNext) {
     const data = await shopifyGraphQL(shop, accessToken, query, { first: 200, after });
     const edges = data?.data?.collections?.edges || [];
@@ -187,137 +199,95 @@ async function getAllCollectionsWithImage(shop, accessToken) {
   return all;
 }
 
-/* ========== XML builders ========== */
+/* ========== XML builders (strict: only existing alt text, no caption) ========== */
 
-function buildImageNode(loc, title) {
+function buildImageNode(loc, altText) {
   return `
     <image:image>
       <image:loc>${x(loc)}</image:loc>
-      ${title ? `<image:title>${x(title)}</image:title>` : ""}
+      ${altText ? `<image:title>${x(altText)}</image:title>` : ""}
     </image:image>`;
 }
 
-function buildUrlNode(pageLoc, imageNodes) {
+function buildUrlNode(pageLoc, lastmodISO, imageNodes) {
   return `
   <url>
     <loc>${x(pageLoc)}</loc>
+    ${lastmodISO ? `<lastmod>${x(lastmodISO)}</lastmod>` : ""}
     ${imageNodes.join("")}
   </url>`;
 }
 
-/* ========== OAuth routes ========== */
-
-/**
- * Kick off OAuth for a shop
- * GET /auth?shop=smelltoimpress.myshopify.com
- */
-app.get("/auth", (req, res) => {
-  const shop = String(req.query.shop || "");
-  if (!shop.endsWith(".myshopify.com")) {
-    return res.status(400).send("Missing or invalid ?shop=myshop.myshopify.com");
-  }
-  const { url } = buildInstallUrl(shop);
-  return res.redirect(url);
-});
-
-/**
- * OAuth callback
- * Shopify redirects to: HOST/auth/callback?shop=...&hmac=...&code=...
- */
-app.get("/auth/callback", async (req, res) => {
-  try {
-    const { shop, code } = req.query;
-    if (!verifyHmacFromQuery(req.query)) {
-      return res.status(400).send("HMAC verification failed");
-    }
-    if (!shop || !code) {
-      return res.status(400).send("Missing shop or code");
-    }
-
-    // Exchange code for access token
-    const tokenResp = await fetch(`https://${shop}/admin/oauth/access_token`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        client_id: APP_API_KEY,
-        client_secret: APP_API_SECRET,
-        code
-      })
-    });
-    if (!tokenResp.ok) {
-      const t = await tokenResp.text();
-      throw new Error(`Access token error ${tokenResp.status}: ${t}`);
-    }
-    const tokenJson = await tokenResp.json();
-    const accessToken = tokenJson.access_token;
-
-    tokenStore.set(String(shop), String(accessToken));
-
-    return res
-      .status(200)
-      .type("text/plain")
-      .send(`Installed for ${shop}. Token stored in memory. You can now hit your App Proxy: https://${stripPort(req.get("host"))}/apps/sitemaps/image.xml`);
-  } catch (e) {
-    console.error(e);
-    return res.status(500).send("OAuth callback error");
-  }
-});
-
-/* ========== App Proxy endpoints ========== */
+/* ========== Main proxy endpoints ========== */
 /*
-  Shopify proxies:
-    /apps/sitemaps/image.xml       -> our server route /image.xml
-    /apps/sitemaps/image-index.xml -> our server route /image-index.xml
+  Proxied by Shopify to:
+    /apps/sitemaps/image.xml         -> GET /image.xml (this server)
+    /apps/sitemaps/image-index.xml   -> GET /image-index.xml
 
-  App Proxy automatically adds ?shop and ?signature
-  Optional query:
-    - type=products|collections|all (default: all)
-    - page=1..N (simple pagination after combining URLs)
+  Query params (optional):
+    - type=products|collections|all  (default: all)
+    - page=1..N                      (default: 1)
+    - per_page=number                (default: env DEFAULT_PER_PAGE, max MAX_URLS_PER_FEED)
 */
 app.get("/image.xml", async (req, res) => {
   try {
-    // Verify proxy signature
-    if (!verifyAppProxy(req)) return res.status(401).send("Invalid signature");
+    if (!verifyProxyHmac(req)) return res.status(401).send("Invalid signature");
 
+    const forwardedHost = req.get("x-forwarded-host") || req.get("host");
+    const host = stripPort(forwardedHost);
     const shop = String(req.query.shop || "");
-    const accessToken = tokenStore.get(shop);
-    if (!accessToken) {
-      // Ask merchant to install
-      const installUrl = `${HOST.replace(/\/$/, "")}/auth?shop=${encodeURIComponent(shop)}`;
-      return res.status(403).type("text/plain").send(`App not installed for ${shop}. Visit ${installUrl}`);
+    const page = Math.max(parseInt(req.query.page || "1", 10), 1);
+    const perPageRaw = Math.max(parseInt(req.query.per_page || String(DEFAULT_PER_PAGE), 10), 1);
+    const perPage = Math.min(perPageRaw, MAX_URLS_PER_FEED);
+    const type = (req.query.type || "all").toLowerCase();
+
+    // cache
+    const key = cacheKey({ route: "image.xml", host, shop, page, perPage, type });
+    const hit = responseCache.get(key);
+    const now = Date.now();
+    if (hit && hit.expiresAt > now) {
+      setXmlHeaders(res);
+      return res.status(200).send(hit.body);
     }
 
-    const host = req.get("x-forwarded-host") || req.get("host");
-    const type = (req.query.type || "all").toLowerCase(); // products|collections|all
-    const page = Math.max(parseInt(req.query.page || "1", 10), 1);
+    const tokenEntry = tokenStore.get(shop);
+    if (!tokenEntry?.accessToken) {
+      return res
+        .status(403)
+        .type("text/plain")
+        .send(`App not installed for ${shop}. Visit ${HOST}/auth?shop=${shop}`);
+    }
 
     const nodes = [];
 
     if (type === "products" || type === "all") {
-      const products = await getAllProductsWithImages(shop, accessToken);
+      const products = await getAllProductsWithImages(shop, tokenEntry.accessToken);
       for (const p of products) {
         const pageUrl = pageUrlForProduct(host, p.handle, p.onlineStoreUrl);
         const images = (p.images?.edges || []).map((e) => e.node);
         if (!images.length) continue;
-        const imageNodes = images.map((img) => buildImageNode(img.url, img.altText || p.title));
-        nodes.push(buildUrlNode(pageUrl, imageNodes));
+        const imageNodes = images.map((img) => buildImageNode(img.url, img.altText)); // strict alt only
+        nodes.push({ lastmod: p.updatedAt, xml: buildUrlNode(pageUrl, p.updatedAt, imageNodes) });
       }
     }
 
     if (type === "collections" || type === "all") {
-      const collections = await getAllCollectionsWithImage(shop, accessToken);
+      const collections = await getAllCollectionsWithImage(shop, tokenEntry.accessToken);
       for (const c of collections) {
         if (!c.image?.url) continue;
         const pageUrl = pageUrlForCollection(host, c.handle);
-        const imageNodes = [buildImageNode(c.image.url, c.image.altText || c.title)];
-        nodes.push(buildUrlNode(pageUrl, imageNodes));
+        const imageNodes = [ buildImageNode(c.image.url, c.image.altText) ]; // strict alt only
+        nodes.push({ lastmod: c.updatedAt, xml: buildUrlNode(pageUrl, c.updatedAt, imageNodes) });
       }
     }
 
+    // Order newest first
+    nodes.sort((a, b) => (a.lastmod < b.lastmod ? 1 : -1));
+
     // Pagination
-    const start = (page - 1) * MAX_URLS_PER_FEED;
-    const end = start + MAX_URLS_PER_FEED;
-    const slice = nodes.slice(start, end);
+    const start = (page - 1) * perPage;
+    const end = start + perPage;
+    const slice = nodes.slice(start, end).map(n => n.xml);
 
     const xml = `<?xml version="1.0" encoding="UTF-8"?>
 <urlset
@@ -325,6 +295,9 @@ app.get("/image.xml", async (req, res) => {
   xmlns:image="http://www.google.com/schemas/sitemap-image/1.1">
 ${slice.join("\n")}
 </urlset>`;
+
+    // Cache store
+    responseCache.set(key, { body: xml, expiresAt: now + CACHE_TTL_SECONDS * 1000 });
 
     setXmlHeaders(res);
     return res.status(200).send(xml);
@@ -334,30 +307,38 @@ ${slice.join("\n")}
   }
 });
 
-// Simple echo endpoint for proxy reachability (no signature check so merchants can test easily)
-app.get("/echo", (req, res) => res.type("text/plain").send("echo ok"));
+// Sanity check
+app.get("/echo", (_req, res) => res.type("text/plain").send("echo ok"));
 
-/* ========== Optional: sitemap index for pagination ========== */
+/* Optional: simple index that links to a few pages for all/type */
 app.get("/image-index.xml", (req, res) => {
-  const host = stripPort(req.get("x-forwarded-host") || req.get("host"));
-  const urls = Array.from({ length: 5 }, (_, i) => i + 1).map(
-    (n) => `<sitemap><loc>https://${host}/apps/sitemaps/image.xml?type=all&page=${n}</loc></sitemap>`
+  const forwardedHost = req.get("x-forwarded-host") || req.get("host");
+  const host = stripPort(forwardedHost);
+  const shop = String(req.query.shop || "");
+  const pages = Number(req.query.pages || 5);
+  const type = String(req.query.type || "all");
+  const perPage = Number(req.query.per_page || DEFAULT_PER_PAGE);
+
+  const urls = Array.from({ length: pages }, (_, i) => i + 1).map(
+    (n) => `<sitemap><loc>https://${host}/apps/sitemaps/image.xml?shop=${shop}&type=${encodeURIComponent(type)}&page=${n}&per_page=${perPage}</loc></sitemap>`
   );
+
   const xml = `<?xml version="1.0" encoding="UTF-8"?>
 <sitemapindex xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
 ${urls.join("\n")}
 </sitemapindex>`;
+
   setXmlHeaders(res);
   return res.status(200).send(xml);
 });
 
-/* ========== Health & Root ========== */
+/* Health & root */
 app.get("/health", (_req, res) => res.type("text/plain").send("ok"));
 app.get("/", (_req, res) => {
   res
     .type("text/plain")
-    .send("Image Sitemap Proxy is running. Use /health or call via Shopify App Proxy at /apps/sitemaps/image.xml");
+    .send("Image Sitemap Proxy is running. Use /health, /echo, or call via Shopify App Proxy at /apps/sitemaps/image.xml");
 });
 
 const port = process.env.PORT || 3000;
-app.listen(port, () => console.log(`Image sitemap proxy (OAuth) on :${port}`));
+app.listen(port, () => console.log(`Image sitemap proxy on :${port}`));
