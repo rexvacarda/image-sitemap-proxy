@@ -7,32 +7,31 @@ const app = express();
 
 /* ========= CONFIG via ENV =========
 Required (OAuth app installed per shop):
-  APP_API_KEY        -> Client ID (Partners)
-  APP_API_SECRET     -> API secret (also used for App Proxy HMAC)
-  HOST               -> e.g. https://image-sitemap-proxy.onrender.com
-  SCOPES             -> e.g. read_products,read_collections
+  APP_API_KEY        -> Client ID from Partner app (used by OAuth routes)
+  APP_API_SECRET     -> API secret key (also App Proxy shared secret for HMAC)
+  HOST               -> Public base URL of this server, e.g. https://image-sitemap-proxy.onrender.com
+  SCOPES             -> e.g. read_products,read_translations
 
 Optional:
-  API_VERSION        -> default 2024-04 (or newer)
-  CACHE_TTL_SECONDS  -> default 600 (10m)
-  MAX_URLS_PER_FEED  -> default 5000
-  DEFAULT_PER_PAGE   -> default 200  (smaller = faster)
-  TR_CONCURRENCY     -> default 6    (translation requests in parallel)
+  API_VERSION        -> Admin API version, default 2024-04
+  CACHE_TTL_SECONDS  -> default 900 (15m)
+  MAX_URLS_PER_FEED  -> default 5000 (keep < 50k)
+  DEFAULT_PER_PAGE   -> default 1000 (capped to MAX_URLS_PER_FEED)
 =================================== */
 
 const APP_API_KEY = process.env.APP_API_KEY || "";
 const APP_API_SECRET = process.env.APP_API_SECRET || "";
 const HOST = process.env.HOST || "";
-const SCOPES = process.env.SCOPES || "read_products,read_collections";
+const SCOPES = process.env.SCOPES || "read_products,read_translations";
 
 const API_VERSION = process.env.API_VERSION || "2024-04";
-const CACHE_TTL_SECONDS = Number(process.env.CACHE_TTL_SECONDS || 600);
+const CACHE_TTL_SECONDS = Number(process.env.CACHE_TTL_SECONDS || 900);
 const MAX_URLS_PER_FEED = Number(process.env.MAX_URLS_PER_FEED || 5000);
-const DEFAULT_PER_PAGE = Math.min(Number(process.env.DEFAULT_PER_PAGE || 200), MAX_URLS_PER_FEED);
-const TR_CONCURRENCY = Math.max(1, Number(process.env.TR_CONCURRENCY || 6));
+const DEFAULT_PER_PAGE = Math.min(Number(process.env.DEFAULT_PER_PAGE || 1000), MAX_URLS_PER_FEED);
 
-// In-memory token store per shop (replace with Redis in production)
+// In-memory token store per shop (replace with Redis for production)
 const tokenStore = new Map(); // shop => { accessToken, installedAt }
+
 // Simple in-memory response cache
 const responseCache = new Map(); // key => { body, expiresAt }
 
@@ -59,7 +58,7 @@ function preferHostImageUrl(originalUrl, host) {
   try {
     const u = new URL(originalUrl);
     if (u.hostname !== "cdn.shopify.com") return originalUrl;
-    const path = u.pathname;
+    const path = u.pathname; // /s/files/.../(products|files)/...
     const idxProducts = path.indexOf("/products/");
     const idxFiles = path.indexOf("/files/");
     let rebuilt = null;
@@ -76,6 +75,7 @@ function pageUrlForProduct(host, handle, onlineStoreUrl) {
   if (onlineStoreUrl) return onlineStoreUrl.replace(/^https?:\/\/[^/]+/, `https://${h}`);
   return `https://${h}/products/${handle}`;
 }
+
 function pageUrlForCollection(host, handle) {
   const h = stripPort(host);
   return `https://${h}/collections/${handle}`;
@@ -89,33 +89,33 @@ function verifyProxyHmac(req) {
   return signature === digest;
 }
 
-/* ---------- Locale detection & mapping ---------- */
-function localeFromHost(host) {
+// Map host → Shopify locale code
+function getLocaleForHost(host, override) {
+  if (override) return override.toLowerCase();
   const h = (host || "").toLowerCase();
-  if (h.startsWith("smelltoimpress.fr")) return "fr";
-  if (h.startsWith("smelltoimpress.it")) return "it";
-  if (h.startsWith("smelltoimpress.jp")) return "ja"; // not "jp"
-  if (h.startsWith("ko.smelltoimpress.com")) return "ko";
-  if (h.startsWith("ar.smelltoimpress.com")) return "ar";
-  if (h.startsWith("iw.smelltoimpress.com")) return "he"; // Hebrew code
-  if (h.startsWith("smelltoimpress.nl")) return "nl";
-  if (h.startsWith("smelltoimpress.ch")) return "de"; // assume DE
-  if (h.startsWith("smelltoimpress.co.no")) return "nb"; // Bokmål
+  if (h.endsWith(".fr")) return "fr";
+  if (h.endsWith(".it")) return "it";
+  if (h.startsWith("ko.")) return "ko";
+  if (h.startsWith("ar.")) return "ar";
+  if (h.startsWith("iw.")) return "he"; // Shopify uses 'he' not 'iw'
+  if (h.endsWith(".nl")) return "nl";
+  if (h.endsWith(".ch")) return "de"; // your CH site is DE content
   return "en";
 }
-function localeCandidates(base) {
-  const b = (base || "en").toLowerCase();
-  const regionByBase = { fr: "FR", it: "IT", nl: "NL", de: "DE", ar: "AR", he: "IL", ko: "KR", ja: "JP", nb: "NO", en: "US" };
-  const region = regionByBase[b] || "US";
-  const arr = [`${b}-${region}`, b];
-  if (b === "de") arr.unshift("de-CH"); // CH special case
-  return Array.from(new Set(arr));
+
+// Extract numeric ID from gid://shopify/Thing/1234567890
+function numericIdFromGid(gid) {
+  if (!gid) return null;
+  const parts = String(gid).split("/");
+  return parts.length ? parts[parts.length - 1] : null;
 }
 
 /* ========== OAuth (public app) minimal flow ========== */
 app.get("/auth", (req, res) => {
   const shop = String(req.query.shop || "");
-  if (!shop || !shop.endsWith(".myshopify.com")) return res.status(400).send("Missing/invalid shop");
+  if (!shop || !shop.endsWith(".myshopify.com")) {
+    return res.status(400).send("Missing/invalid shop");
+  }
   const state = crypto.randomBytes(12).toString("hex");
   const redirectUri = `${HOST}/auth/callback`;
   const url = `https://${shop}/admin/oauth/authorize?client_id=${APP_API_KEY}` +
@@ -124,6 +124,7 @@ app.get("/auth", (req, res) => {
               `&state=${state}`;
   res.redirect(url);
 });
+
 app.get("/auth/callback", async (req, res) => {
   try {
     const { shop, code } = req.query;
@@ -131,23 +132,29 @@ app.get("/auth/callback", async (req, res) => {
     const tokenResp = await fetch(`https://${shop}/admin/oauth/access_token`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ client_id: APP_API_KEY, client_secret: APP_API_SECRET, code })
+      body: JSON.stringify({
+        client_id: APP_API_KEY,
+        client_secret: APP_API_SECRET,
+        code
+      })
     });
-    if (!tokenResp.ok) return res.status(400).send(`Token exchange failed: ${await tokenResp.text()}`);
+    if (!tokenResp.ok) {
+      const t = await tokenResp.text();
+      return res.status(400).send(`Token exchange failed: ${t}`);
+    }
     const json = await tokenResp.json();
     tokenStore.set(shop, { accessToken: json.access_token, installedAt: Date.now() });
-    res.type("text/plain").send(
-      `Installed for ${shop}. Token stored in memory. App Proxy: https://${stripPort(req.get("host"))}/apps/sitemaps/image.xml`
-    );
+    res
+      .type("text/plain")
+      .send(`Installed for ${shop}. Token stored in memory. You can now hit your App Proxy: https://${stripPort(req.get("host"))}/apps/sitemaps/image.xml`);
   } catch (err) {
     console.error(err);
     res.status(500).send("OAuth error");
   }
 });
 
-/* ========== Admin API fetchers (page-aware) ========== */
+/* ========== Admin API fetchers (use per-shop token) ========== */
 
-// Generic cursor page fetcher
 async function shopifyGraphQL(shop, accessToken, query, variables = {}) {
   const resp = await fetch(`https://${shop}/admin/api/${API_VERSION}/graphql.json`, {
     method: "POST",
@@ -157,180 +164,102 @@ async function shopifyGraphQL(shop, accessToken, query, variables = {}) {
     },
     body: JSON.stringify({ query, variables }),
   });
-  if (!resp.ok) throw new Error(`Admin API ${resp.status}: ${await resp.text()}`);
+  if (!resp.ok) {
+    const text = await resp.text();
+    throw new Error(`Admin API ${resp.status}: ${text}`);
+  }
   return resp.json();
 }
 
-const PRODUCTS_Q = `
-  query Products($first:Int!, $after:String) {
-    products(first:$first, after:$after, query:"status:active") {
-      edges {
-        cursor
-        node {
-          id
-          title
-          handle
-          onlineStoreUrl
-          updatedAt
-          images(first:50) { edges { node { id url altText } } }
-        }
-      }
-      pageInfo { hasNextPage }
-    }
-  }
-`;
-const COLLECTIONS_Q = `
-  query Collections($first:Int!, $after:String) {
-    collections(first:$first, after:$after, query:"published_status:published") {
-      edges {
-        cursor
-        node {
-          id
-          title
-          handle
-          updatedAt
-          image { id url altText }
-        }
-      }
-      pageInfo { hasNextPage }
-    }
-  }
-`;
-
-async function fetchSlice(shop, token, gql, pageSize, startIndex, limit) {
-  // Walk pages of size 100 until we reach startIndex, then collect <= limit items
-  const apiPageSize = 100; // stable + efficient
-  let collected = [];
-  let after = null;
-  let seen = 0;
-  let hasNext = true;
-
-  while (hasNext && collected.length < limit) {
-    const data = await shopifyGraphQL(shop, token, gql, { first: apiPageSize, after });
-    const edges = (data?.data?.products?.edges || data?.data?.collections?.edges || []);
-    if (!edges.length) break;
-
-    for (const e of edges) {
-      if (seen >= startIndex && collected.length < limit) {
-        collected.push(e.node);
-      }
-      seen++;
-      if (collected.length >= limit) break;
-    }
-
-    hasNext = (data?.data?.products?.pageInfo?.hasNextPage ?? data?.data?.collections?.pageInfo?.hasNextPage) || false;
-    after = edges.length ? edges[edges.length - 1].cursor : null;
-  }
-  return collected;
+// Admin REST Translations API for a single product
+async function fetchProductTranslations(shop, token, productNumericId, locale) {
+  const url = `https://${shop}/admin/api/${API_VERSION}/translations.json?locale=${encodeURIComponent(locale)}&resource_type=Product&resource_id=${productNumericId}`;
+  const resp = await fetch(url, {
+    headers: { "X-Shopify-Access-Token": token, "Content-Type": "application/json" }
+  });
+  if (!resp.ok) return null;
+  const json = await resp.json();
+  return json?.translations || null;
 }
 
-async function getProductsPage(shop, token, startIndex, limit) {
-  return fetchSlice(shop, token, PRODUCTS_Q, 100, startIndex, limit);
-}
-async function getCollectionsPage(shop, token, startIndex, limit) {
-  return fetchSlice(shop, token, COLLECTIONS_Q, 100, startIndex, limit);
-}
-
-/* ---------- Translations (with small concurrency) ---------- */
-
-async function asyncPool(limit, items, itFn) {
-  const ret = [];
-  const executing = [];
-  for (const item of items) {
-    const p = Promise.resolve().then(() => itFn(item));
-    ret.push(p);
-    if (limit <= items.length) {
-      const e = p.then(() => executing.splice(executing.indexOf(e), 1));
-      executing.push(e);
-      if (executing.length >= limit) await Promise.race(executing);
-    }
-  }
-  return Promise.all(ret);
+// Admin REST Translations API for a single collection
+async function fetchCollectionTranslations(shop, token, collectionNumericId, locale) {
+  const url = `https://${shop}/admin/api/${API_VERSION}/translations.json?locale=${encodeURIComponent(locale)}&resource_type=Collection&resource_id=${collectionNumericId}`;
+  const resp = await fetch(url, {
+    headers: { "X-Shopify-Access-Token": token, "Content-Type": "application/json" }
+  });
+  if (!resp.ok) return null;
+  const json = await resp.json();
+  return json?.translations || null;
 }
 
-async function hydrateProductTranslations(shop, token, products, localeBase) {
-  const tryLocs = localeCandidates(localeBase);
-  const q = `
-    query TR($rid: ID!, $loc: String!) {
-      translatableResource(resourceId: $rid) {
-        translations(locale: $loc) { key value } # title, body_html, etc.
-        ... on Product {
-          images(first: 50) {
-            edges {
-              node {
-                id
-                translations(locale: $loc) { key value } # alt
-              }
+async function getAllProductsWithImages(shop, accessToken) {
+  const query = `
+    query Products($first:Int!, $after:String) {
+      products(first:$first, after:$after, query:"status:active") {
+        edges {
+          cursor
+          node {
+            id
+            title
+            handle
+            onlineStoreUrl
+            updatedAt
+            images(first:50) {
+              edges { node { id url altText } }
             }
           }
         }
+        pageInfo { hasNextPage }
       }
     }
   `;
-
-  await asyncPool(TR_CONCURRENCY, products, async (p) => {
-    for (const loc of tryLocs) {
-      try {
-        const data = await shopifyGraphQL(shop, token, q, { rid: p.id, loc });
-        const tr = data?.data?.translatableResource;
-        if (!tr) continue;
-        const title = tr.translations?.find(t => t.key === "title")?.value;
-        if (title) p.title = title;
-
-        // Map image ID -> alt
-        const imgEdges = tr.images?.edges || [];
-        const altById = new Map();
-        for (const e of imgEdges) {
-          const alt = e.node?.translations?.find(t => t.key === "alt")?.value;
-          if (alt) altById.set(e.node.id, alt);
-        }
-        for (const e of p.images?.edges || []) {
-          const alt = altById.get(e.node.id);
-          if (alt) e.node.altText = alt;
-        }
-        break; // stop after first successful locale
-      } catch {
-        // try next candidate
-      }
-    }
-  });
+  const all = [];
+  let after = null;
+  let hasNext = true;
+  while (hasNext) {
+    const data = await shopifyGraphQL(shop, accessToken, query, { first: 100, after });
+    const edges = data?.data?.products?.edges || [];
+    for (const e of edges) all.push(e.node);
+    hasNext = data?.data?.products?.pageInfo?.hasNextPage;
+    after = edges.length ? edges[edges.length - 1].cursor : null;
+  }
+  return all;
 }
 
-async function hydrateCollectionTranslations(shop, token, collections, localeBase) {
-  const tryLocs = localeCandidates(localeBase);
-  const q = `
-    query TRC($rid: ID!, $loc: String!) {
-      translatableResource(resourceId: $rid) {
-        translations(locale: $loc) { key value }  # title, body_html
-        ... on Collection {
-          image {
+async function getAllCollectionsWithImage(shop, accessToken) {
+  const query = `
+    query Collections($first:Int!, $after:String) {
+      collections(first:$first, after:$after, query:"published_status:published") {
+        edges {
+          cursor
+          node {
             id
-            translations(locale: $loc) { key value } # alt
+            title
+            handle
+            updatedAt
+            image { id url altText }
           }
         }
+        pageInfo { hasNextPage }
       }
     }
   `;
-
-  await asyncPool(TR_CONCURRENCY, collections, async (c) => {
-    for (const loc of tryLocs) {
-      try {
-        const data = await shopifyGraphQL(shop, token, q, { rid: c.id, loc });
-        const tr = data?.data?.translatableResource;
-        if (!tr) continue;
-        const title = tr.translations?.find(t => t.key === "title")?.value;
-        if (title) c.title = title;
-        const alt = tr.image?.translations?.find(t => t.key === "alt")?.value;
-        if (alt && c.image) c.image.altText = alt;
-        break;
-      } catch {
-        // try next candidate
-      }
-    }
-  });
+  const all = [];
+  let after = null;
+  let hasNext = true;
+  while (hasNext) {
+    const data = await shopifyGraphQL(shop, accessToken, query, { first: 200, after });
+    const edges = data?.data?.collections?.edges || [];
+    for (const e of edges) all.push(e.node);
+    hasNext = data?.data?.collections?.pageInfo?.hasNextPage;
+    after = edges.length ? edges[edges.length - 1].cursor : null;
+  }
+  return all;
 }
 
-/* ========== XML builders ========== */
+/* ========== XML builders (with titles + captions, host-pref images) ========== */
+
 function buildImageNode(loc, title, caption) {
   return `
         <image:image>
@@ -339,6 +268,7 @@ function buildImageNode(loc, title, caption) {
           ${caption ? `<image:caption>${x(caption)}</image:caption>` : ""}
         </image:image>`;
 }
+
 function buildUrlNode(pageLoc, lastmodISO, imageNodes) {
   return `<url>
       <loc>${x(pageLoc)}</loc>
@@ -347,20 +277,6 @@ function buildUrlNode(pageLoc, lastmodISO, imageNodes) {
 }
 
 /* ========== Main proxy endpoints ========== */
-/*
-  Via App Proxy:
-    /apps/sitemaps/image.xml
-    /apps/sitemaps/image-index.xml
-
-  Query params:
-    - shop=STORE.myshopify.com
-    - type=products|collections|all (default: all)
-    - page=1..N (default: 1)
-    - per_page=number (default: env DEFAULT_PER_PAGE, max MAX_URLS_PER_FEED)
-    - locale=fr (override host-detected locale)
-    - captions=0|1 (default: 1)
-    - prefer_host=0|1 (default: 1)
-*/
 app.get("/image.xml", async (req, res) => {
   try {
     if (!verifyProxyHmac(req)) return res.status(401).send("Invalid signature");
@@ -374,11 +290,10 @@ app.get("/image.xml", async (req, res) => {
     const type = (req.query.type || "all").toLowerCase();
     const includeCaptions = String(req.query.captions || "1") === "1";
     const preferHost = String(req.query.prefer_host || "1") === "1";
-    const overrideLocale = (req.query.locale || "").toString().trim();
-    const localeBase = overrideLocale || localeFromHost(host);
+    const locale = getLocaleForHost(host, req.query.locale);
 
-    // Cache
-    const key = cacheKey({ route: "image.xml", host, shop, page, perPage, type, includeCaptions, preferHost, localeBase });
+    // cache
+    const key = cacheKey({ route: "image.xml", host, shop, page, perPage, type, includeCaptions, preferHost, locale });
     const hit = responseCache.get(key);
     const now = Date.now();
     if (hit && hit.expiresAt > now) {
@@ -388,54 +303,118 @@ app.get("/image.xml", async (req, res) => {
 
     const tokenEntry = tokenStore.get(shop);
     if (!tokenEntry?.accessToken) {
-      return res.status(403).type("text/plain").send(`App not installed for ${shop}. Visit ${HOST}/auth?shop=${shop}`);
+      return res
+        .status(403)
+        .type("text/plain")
+        .send(`App not installed for ${shop}. Visit ${HOST}/auth?shop=${shop}`);
     }
 
-    const startIndex = (page - 1) * perPage;
-    const nodes = [];
+    // 1) Gather nodes (still loads all, then paginate — simplest for now)
+    const baseNodes = [];
 
     if (type === "products" || type === "all") {
-      const products = await getProductsPage(shop, tokenEntry.accessToken, startIndex, perPage);
-      await hydrateProductTranslations(shop, tokenEntry.accessToken, products, localeBase);
-
+      const products = await getAllProductsWithImages(shop, tokenEntry.accessToken);
       for (const p of products) {
         const pageUrl = pageUrlForProduct(host, p.handle, p.onlineStoreUrl);
-        const images = (p.images?.edges || []).map(e => e.node);
+        const images = (p.images?.edges || []).map((e) => e.node);
         if (!images.length) continue;
-
-        const imageNodes = images.map(img => {
-          const imgUrl = preferHost ? preferHostImageUrl(img.url, host) : img.url;
-          const title = img.altText || p.title || "";
-          const caption = includeCaptions && img.altText ? img.altText : (includeCaptions ? p.title || "" : "");
-          return buildImageNode(imgUrl, title, caption);
+        baseNodes.push({
+          kind: "product",
+          lastmod: p.updatedAt,
+          pageUrl,
+          productId: p.id,
+          title: p.title,
+          images // {id,url,altText}
         });
-
-        nodes.push({ lastmod: p.updatedAt, xml: buildUrlNode(pageUrl, p.updatedAt, imageNodes) });
       }
     }
 
     if (type === "collections" || type === "all") {
-      const collections = await getCollectionsPage(shop, tokenEntry.accessToken, startIndex, perPage);
-      await hydrateCollectionTranslations(shop, tokenEntry.accessToken, collections, localeBase);
-
+      const collections = await getAllCollectionsWithImage(shop, tokenEntry.accessToken);
       for (const c of collections) {
         if (!c.image?.url) continue;
         const pageUrl = pageUrlForCollection(host, c.handle);
-        const imgUrl = preferHost ? preferHostImageUrl(c.image.url, host) : c.image.url;
-        const title = c.image.altText || c.title || "";
-        const caption = includeCaptions && c.image.altText ? c.image.altText : (includeCaptions ? c.title || "" : "");
-        const imageNodes = [buildImageNode(imgUrl, title, caption)];
-        nodes.push({ lastmod: c.updatedAt, xml: buildUrlNode(pageUrl, c.updatedAt, imageNodes) });
+        baseNodes.push({
+          kind: "collection",
+          lastmod: c.updatedAt,
+          pageUrl,
+          collectionId: c.id,
+          title: c.title,
+          image: c.image // {id,url,altText}
+        });
       }
     }
 
-    // Sort newest first (small current page only)
-    nodes.sort((a, b) => (a.lastmod < b.lastmod ? 1 : -1));
+    // 2) Order newest first and slice the page
+    baseNodes.sort((a, b) => (a.lastmod < b.lastmod ? 1 : -1));
+    const start = (page - 1) * perPage;
+    const end = start + perPage;
+    const slice = baseNodes.slice(start, end);
+
+    // 3) For THIS slice only, fetch translations and build XML
+    const out = [];
+    for (const node of slice) {
+      if (node.kind === "product") {
+        const numId = numericIdFromGid(node.productId);
+        let titleTr = node.title;
+        const imageAltMap = new Map(); // imageId => alt
+        if (numId) {
+          const trs = await fetchProductTranslations(shop, tokenEntry.accessToken, numId, locale);
+          if (Array.isArray(trs)) {
+            for (const t of trs) {
+              // product title
+              if (t.key === "title" && t.value) titleTr = t.value;
+              // image alt keys can be "image[<id>].alt" OR "image.alt_text"
+              if (t.key && t.value) {
+                // image[123].alt
+                const m = t.key.match(/^image\[(\d+)\]\.alt$/i);
+                if (m) imageAltMap.set(m[1], t.value);
+                // image.alt_text (rarely global)
+                if (t.key === "image.alt_text") imageAltMap.set("*", t.value);
+              }
+            }
+          }
+        }
+        const imgs = node.images.map((img) => {
+          const imgIdNum = numericIdFromGid(img.id);
+          const translatedAlt = (imgIdNum && imageAltMap.get(imgIdNum)) || imageAltMap.get("*") || img.altText || "";
+          const imgUrl = preferHost ? preferHostImageUrl(img.url, host) : img.url;
+          const title = translatedAlt || ""; // strict: only alt, no fallback to EN title
+          const caption = includeCaptions && translatedAlt ? translatedAlt : "";
+          return buildImageNode(imgUrl, title, caption);
+        });
+        out.push(buildUrlNode(node.pageUrl, node.lastmod, imgs));
+      } else {
+        // collection
+        const numId = numericIdFromGid(node.collectionId);
+        let titleTr = node.title;
+        let imageAlt = node.image?.altText || "";
+        if (numId) {
+          const trs = await fetchCollectionTranslations(shop, tokenEntry.accessToken, numId, locale);
+          if (Array.isArray(trs)) {
+            for (const t of trs) {
+              if (t.key === "title" && t.value) titleTr = t.value;
+              const m = t.key && t.key.match(/^image\[(\d+)\]\.alt$/i);
+              if (m && node.image?.id) {
+                const imgIdNum = numericIdFromGid(node.image.id);
+                if (imgIdNum && imgIdNum === m[1]) imageAlt = t.value;
+              }
+              if (t.key === "image.alt_text" && t.value) imageAlt = t.value;
+            }
+          }
+        }
+        const imgUrl = preferHost ? preferHostImageUrl(node.image.url, host) : node.image.url;
+        const title = imageAlt || "";
+        const caption = includeCaptions && imageAlt ? imageAlt : "";
+        const imgs = [buildImageNode(imgUrl, title, caption)];
+        out.push(buildUrlNode(node.pageUrl, node.lastmod, imgs));
+      }
+    }
 
     const xml = `<?xml version="1.0" encoding="UTF-8"?>
 <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9"
         xmlns:image="http://www.google.com/schemas/sitemap-image/1.1">
-${nodes.map(n => n.xml).join("\n")}
+${out.join("\n")}
 </urlset>`;
 
     responseCache.set(key, { body: xml, expiresAt: now + CACHE_TTL_SECONDS * 1000 });
@@ -447,8 +426,10 @@ ${nodes.map(n => n.xml).join("\n")}
   }
 });
 
-// sanity + index
+// Sanity check
 app.get("/echo", (_req, res) => res.type("text/plain").send("echo ok"));
+
+/* Optional: simple index that links to a few pages for all/type */
 app.get("/image-index.xml", (req, res) => {
   const forwardedHost = req.get("x-forwarded-host") || req.get("host");
   const host = stripPort(forwardedHost);
@@ -456,21 +437,27 @@ app.get("/image-index.xml", (req, res) => {
   const pages = Number(req.query.pages || 5);
   const type = String(req.query.type || "all");
   const perPage = Number(req.query.per_page || DEFAULT_PER_PAGE);
-  const locale = String(req.query.locale || "");
+  const locale = req.query.locale ? `&locale=${encodeURIComponent(req.query.locale)}` : "";
+
   const urls = Array.from({ length: pages }, (_, i) => i + 1).map(
-    (n) => `<sitemap><loc>https://${host}/apps/sitemaps/image.xml?shop=${shop}&type=${encodeURIComponent(type)}&page=${n}&per_page=${perPage}${locale ? `&locale=${encodeURIComponent(locale)}` : ""}</loc></sitemap>`
+    (n) => `<sitemap><loc>https://${host}/apps/sitemaps/image.xml?shop=${shop}&type=${encodeURIComponent(type)}&page=${n}&per_page=${perPage}${locale}</loc></sitemap>`
   );
+
   const xml = `<?xml version="1.0" encoding="UTF-8"?>
 <sitemapindex xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
 ${urls.join("\n")}
 </sitemapindex>`;
+
   setXmlHeaders(res);
   return res.status(200).send(xml);
 });
 
+/* Health & root */
 app.get("/health", (_req, res) => res.type("text/plain").send("ok"));
 app.get("/", (_req, res) => {
-  res.type("text/plain").send("Image Sitemap Proxy is running. Use /health, /echo, or call via Shopify App Proxy at /apps/sitemaps/image.xml");
+  res
+    .type("text/plain")
+    .send("Image Sitemap Proxy is running. Use /health, /echo, or call via Shopify App Proxy at /apps/sitemaps/image.xml");
 });
 
 const port = process.env.PORT || 3000;
