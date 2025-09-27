@@ -176,15 +176,15 @@ function buildUrlNode(pageLoc, imageNodes) {
 
 /* ========== Main endpoint ========== */
 /*
-  Shopify proxies:
-    /apps/sitemaps/image.xml       -> our server route /image.xml
-    /apps/sitemaps/image-index.xml -> our server route /image-index.xml
+  Accept BOTH path styles (Shopify may strip /apps/sitemaps, or not depending on config):
+    - /image.xml
+    - /apps/sitemaps/image.xml
 
   Optional query:
     - type=products|collections|all (default: all)
     - page=1..N (simple pagination after combining URLs)
 */
-app.get("/image.xml", async (req, res) => {
+app.get(["/image.xml", "/apps/sitemaps/image.xml"], async (req, res) => {
   try {
     if (!verifyAppProxy(req)) return res.status(401).send("Invalid signature");
 
@@ -237,8 +237,7 @@ ${slice.join("\n")}
 });
 
 /* ========== Optional: index for paginated feeds ========== */
-app.get("/echo", (req,res)=>res.type("text/plain").send("echo ok"));
-app.get("/image-index.xml", (req, res) => {
+app.get(["/image-index.xml", "/apps/sitemaps/image-index.xml"], (req, res) => {
   const host = stripPort(req.get("x-forwarded-host") || req.get("host"));
   const urls = Array.from({ length: 5 }, (_, i) => i + 1).map(
     (n) => `<sitemap><loc>https://${host}/apps/sitemaps/image.xml?type=all&page=${n}</loc></sitemap>`
@@ -251,13 +250,15 @@ ${urls.join("\n")}
   return res.status(200).send(xml);
 });
 
-/* ========== Health & Root ========== */
+/* ========== Health & Root & Debug Echo ========== */
 app.get("/health", (_req, res) => res.type("text/plain").send("ok"));
 app.get("/", (_req, res) => {
   res
     .type("text/plain")
     .send("Image Sitemap Proxy is running. Use /health or call via Shopify App Proxy at /apps/sitemaps/image.xml");
 });
+// Temporary debug route; accessible via /apps/sitemaps/echo through the proxy
+app.get(["/echo", "/apps/sitemaps/echo"], (req, res) => res.type("text/plain").send("echo ok"));
 
 const port = process.env.PORT || 3000;
 app.listen(port, () => console.log(`Image sitemap proxy on :${port}`));
