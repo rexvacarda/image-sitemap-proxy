@@ -365,19 +365,23 @@ app.get("/proxy-debug", (req, res) => {
 
 /* ---------- Index, health ---------- */
 app.get("/image-index.xml",(req,res)=>{
-  const forwardedHost=req.get("x-forwarded-host")||req.get("host");
-  const host=stripPort(forwardedHost);
-  const pages=Number(req.query.pages||5);
-  const type=String(req.query.type||"products");
-  const perPage=Number(req.query.per_page||DEFAULT_PER_PAGE);
-  const locale=req.query.locale?`&locale=${encodeURIComponent(req.query.locale)}`:"";
-  const urls=Array.from({length:pages},(_,i)=>i+1).map(
-    n=>`<sitemap><loc>https://${host}/apps/sitemaps/image.xml?type=${encodeURIComponent(type)}&page=${n}&per_page=${perPage}${locale}</loc></sitemap>`
-  );
-  const xml=`<?xml version="1.0" encoding="UTF-8"?>
+  const forwardedHost = req.get("x-forwarded-host") || req.get("host");
+  const host = stripPort(forwardedHost);
+  const pages = Number(req.query.pages || 5);
+  const type = String(req.query.type || "products");
+  const perPage = Number(req.query.per_page || DEFAULT_PER_PAGE);
+  const localeParam = req.query.locale ? `&locale=${encodeURIComponent(req.query.locale)}` : "";
+
+  const items = Array.from({ length: pages }, (_, i) => i + 1).map((n) => {
+    const rawUrl = `https://${host}/apps/sitemaps/image.xml?type=${encodeURIComponent(type)}&page=${n}&per_page=${perPage}${localeParam}`;
+    return `<sitemap><loc>${x(rawUrl)}</loc></sitemap>`; // <-- escape with x()
+  });
+
+  const xml = `<?xml version="1.0" encoding="UTF-8"?>
 <sitemapindex xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
-${urls.join("\n")}
+${items.join("\n")}
 </sitemapindex>`;
+
   setXmlHeaders(res);
   return res.status(200).send(xml);
 });
