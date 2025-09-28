@@ -7,25 +7,24 @@ const app = express();
 
 /* ========= CONFIG via ENV (HYBRID) =========
 Required:
-  SHOP
-  ADMIN_API_TOKEN
-  SHARED_SECRET
-Optional (recommended):
-  STOREFRONT_TOKEN   -> enables fully localized fetch via Storefront API
-  SF_API_VERSION     -> default 2024-07
-  API_VERSION        -> default 2024-04
-  CACHE_TTL_SECONDS  -> default 900
-  MAX_URLS_PER_FEED  -> default 5000
-  DEFAULT_PER_PAGE   -> default 200
-  HTTP_TIMEOUT_MS    -> default 12000
-  TRANS_CONCURRENCY  -> default 8
+  SHOP                -> e.g. smelltoimpress.myshopify.com
+  ADMIN_API_TOKEN     -> Admin API token from your Custom App (read_products, read_translations)
+  SHARED_SECRET       -> App Proxy "API secret key" from the Partner App WITH the App Proxy
+
+Optional:
+  API_VERSION         -> default 2024-04
+  CACHE_TTL_SECONDS   -> default 900
+  MAX_URLS_PER_FEED   -> default 5000
+  DEFAULT_PER_PAGE    -> default 200
+  HTTP_TIMEOUT_MS     -> default 12000
+  TRANS_CONCURRENCY   -> default 8
+  DISABLE_HMAC        -> "1" to bypass proxy HMAC check (for local testing only)
 ============================================= */
 
 const SHOP = process.env.SHOP || "";
 const ADMIN_API_TOKEN = process.env.ADMIN_API_TOKEN || "";
 const SHARED_SECRET = process.env.SHARED_SECRET || "";
-const STOREFRONT_TOKEN = process.env.STOREFRONT_TOKEN || "";
-const SF_API_VERSION = process.env.SF_API_VERSION || "2024-07";
+const DISABLE_HMAC = String(process.env.DISABLE_HMAC || "0") === "1";
 
 const API_VERSION = process.env.API_VERSION || "2024-04";
 const CACHE_TTL_SECONDS = Number(process.env.CACHE_TTL_SECONDS || 900);
@@ -34,7 +33,11 @@ const DEFAULT_PER_PAGE = Math.min(Number(process.env.DEFAULT_PER_PAGE || 200), M
 const HTTP_TIMEOUT_MS = Number(process.env.HTTP_TIMEOUT_MS || 12000);
 const TRANS_CONCURRENCY = Math.max(1, Number(process.env.TRANS_CONCURRENCY || 8));
 
-const responseCache = new Map();
+if (!SHOP) console.error("[startup] Missing SHOP env");
+if (!ADMIN_API_TOKEN) console.error("[startup] Missing ADMIN_API_TOKEN env");
+if (!SHARED_SECRET) console.error("[startup] Missing SHARED_SECRET env");
+
+const responseCache = new Map(); // key -> { body, expiresAt }
 
 /* ---------- Utils ---------- */
 
@@ -63,25 +66,50 @@ function pageUrlForCollection(host, handle){
   const h=stripPort(host);
   return `https://${h}/collections/${handle}`;
 }
+
+/** Hardened App Proxy HMAC check (Shopify signs the sorted query-string sans signature) */
 function verifyProxyHmac(req){
-  const { signature, ...params }=req.query;
-  if(!SHARED_SECRET||!signature) return false;
-  const sorted=Object.keys(params).sort().map(k=>`${k}=${params[k]}`).join("");
-  const digest=crypto.createHmac("sha256",SHARED_SECRET).update(sorted).digest("hex");
-  return signature===digest;
+  if (DISABLE_HMAC) return true; // for local testing only
+  const query = { ...req.query };
+  const provided = (query.signature || query.sig || "").toString().toLowerCase();
+  delete query.signature;
+  delete query.sig;
+
+  if (!SHARED_SECRET || !provided) return false;
+
+  const payload = Object.keys(query)
+    .sort()
+    .map(k => `${k}=${query[k]}`)
+    .join("");
+
+  const expected = crypto
+    .createHmac("sha256", SHARED_SECRET)
+    .update(payload)
+    .digest("hex")
+    .toLowerCase();
+
+  try {
+    const a = Buffer.from(expected, "hex");
+    const b = Buffer.from(provided, "hex");
+    return a.length === b.length && crypto.timingSafeEqual(a, b);
+  } catch {
+    return false;
+  }
 }
+
 function getLocaleForHost(host, override){
-  if (override) return override.toLowerCase();
+  if(override) return override.toLowerCase();
   const h=(host||"").toLowerCase();
-  if (h.endsWith(".fr")) return "fr";
-  if (h.endsWith(".it")) return "it";
-  if (h.startsWith("ko.")) return "ko";
-  if (h.startsWith("ar.")) return "ar";
-  if (h.startsWith("iw.")) return "he";
-  if (h.endsWith(".nl")) return "nl";
-  if (h.endsWith(".ch")) return "de";
+  if(h.endsWith(".fr")) return "fr";
+  if(h.endsWith(".it")) return "it";
+  if(h.startsWith("ko.")) return "ko";
+  if(h.startsWith("ar.")) return "ar";
+  if(h.startsWith("iw.")) return "he";
+  if(h.endsWith(".nl")) return "nl";
+  if(h.endsWith(".ch")) return "de";
   return "en";
 }
+function numericIdFromGid(gid){ if(!gid) return null; const parts=String(gid).split("/"); return parts.length?parts[parts.length-1]:null; }
 async function timedFetch(url, opts={}, timeoutMs=HTTP_TIMEOUT_MS){
   const c=new AbortController(); const t=setTimeout(()=>c.abort(),timeoutMs);
   try{return await fetch(url,{...opts,signal:c.signal});} finally{clearTimeout(t);}
@@ -98,72 +126,12 @@ async function pMap(items, limit, mapper){
   return Promise.all(ret);
 }
 
-/* ---------- Storefront API (localized) ---------- */
-
-async function sfGraphQL(query, variables, acceptLanguage){
-  const resp = await timedFetch(`https://${SHOP}/api/${SF_API_VERSION}/graphql.json`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "X-Shopify-Storefront-Access-Token": STOREFRONT_TOKEN,
-      ...(acceptLanguage ? { "Accept-Language": acceptLanguage } : {})
-    },
-    body: JSON.stringify({ query, variables })
-  });
-  if (!resp.ok) {
-    const text = await resp.text();
-    throw new Error(`Storefront API ${resp.status}: ${text}`);
-  }
-  return resp.json();
-}
-
-// Return newest-first slice, localized (title, altText)
-async function sfGetProductsSlice(offset, limit, acceptLanguage){
-  // Storefront cannot ask by offset directly; fetch a larger page and slice.
-  const pageSize = Math.min(Math.max(limit, 50), 250);
-  const resp = await sfGraphQL(`
-    query($first:Int!) {
-      products(first:$first, sortKey:UPDATED_AT, reverse:true) {
-        nodes {
-          handle
-          title
-          onlineStoreUrl
-          updatedAt
-          images(first:50) { nodes { url altText } }
-        }
-      }
-    }`, { first: pageSize + offset }, acceptLanguage);
-
-  const nodes = resp?.data?.products?.nodes || [];
-  return nodes.slice(offset, offset + limit);
-}
-
-async function sfGetCollectionsSlice(offset, limit, acceptLanguage){
-  const pageSize = Math.min(Math.max(limit, 50), 250);
-  const resp = await sfGraphQL(`
-    query($first:Int!) {
-      collections(first:$first, sortKey:UPDATED_AT, reverse:true) {
-        nodes {
-          handle
-          title
-          updatedAt
-          image { url altText }
-        }
-      }
-    }`, { first: pageSize + offset }, acceptLanguage);
-
-  const nodes = resp?.data?.collections?.nodes || [];
-  return nodes.slice(offset, offset + limit);
-}
-
-/* ---------- Admin API (fallback) ---------- */
-/* (your existing Admin GraphQL + translations helpers remain as-is;
-   keeping them for when STOREFRONT_TOKEN isn’t set) */
+/* ---------- Admin API fetchers (slice) ---------- */
 
 async function gqlPagedSlice({ query, selectEdges, first, offset, take }){
   let after=null; let skipped=0; const out=[];
   while(out.length<take){
-    const resp=await timedFetch(`https://${SHOP}/admin/api/${API_VERSION}/graphql.json`, {
+    const resp=await timedFetch(`https://${SHOP}/admin/api/${API_VERSION}/graphql.json`,{
       method:"POST",
       headers:{ "X-Shopify-Access-Token":ADMIN_API_TOKEN,"Content-Type":"application/json"},
       body:JSON.stringify({ query, variables:{ first, after }})
@@ -201,7 +169,11 @@ async function getProductsSlice(offset, limit){
         pageInfo { hasNextPage }
       }
     }`;
-  return gqlPagedSlice({ query, selectEdges:j=>j?.data?.products?.edges, first:100, offset, take:limit });
+  return gqlPagedSlice({
+    query,
+    selectEdges:j=>j?.data?.products?.edges,
+    first:100, offset, take:limit
+  });
 }
 
 async function getCollectionsSlice(offset, limit){
@@ -221,7 +193,43 @@ async function getCollectionsSlice(offset, limit){
         pageInfo { hasNextPage }
       }
     }`;
-  return gqlPagedSlice({ query, selectEdges:j=>j?.data?.collections?.edges, first:200, offset, take:limit });
+  return gqlPagedSlice({
+    query,
+    selectEdges:j=>j?.data?.collections?.edges,
+    first:200, offset, take:limit
+  });
+}
+
+/* ---------- Translations (Admin REST) ---------- */
+
+async function fetchProductTranslations(numericId, locale){
+  const url=`https://${SHOP}/admin/api/${API_VERSION}/translations.json?locale=${encodeURIComponent(locale)}&resource_type=Product&resource_id=${numericId}`;
+  const resp=await timedFetch(url,{ headers:{ "X-Shopify-Access-Token":ADMIN_API_TOKEN,"Content-Type":"application/json"}});
+  if(!resp.ok) return null;
+  const json=await resp.json(); return json?.translations||null;
+}
+async function fetchCollectionTranslations(numericId, locale){
+  const url=`https://${SHOP}/admin/api/${API_VERSION}/translations.json?locale=${encodeURIComponent(locale)}&resource_type=Collection&resource_id=${numericId}`;
+  const resp=await timedFetch(url,{ headers:{ "X-Shopify-Access-Token":ADMIN_API_TOKEN,"Content-Type":"application/json"}});
+  if(!resp.ok) return null;
+  const json=await resp.json(); return json?.translations||null;
+}
+
+function extractTranslatedValue(translations, keyExact){
+  if(!translations) return "";
+  for(const t of translations){ if(t.key===keyExact && t.value) return String(t.value); }
+  return "";
+}
+function buildImageAltMapFromTranslations(translations){
+  const map=new Map();
+  if(!translations) return map;
+  for(const t of translations){
+    if(!t?.key||!t?.value) continue;
+    if(t.key==="image.alt_text"){ map.set("*",String(t.value)); continue; }
+    const m=t.key.match(/^image\[(\d+)\]\.alt$/i);
+    if(m) map.set(m[1],String(t.value));
+  }
+  return map;
 }
 
 /* ---------- XML builders ---------- */
@@ -241,7 +249,7 @@ function buildUrlNode(pageLoc, lastmodISO, imageNodes){
     </url>`;
 }
 
-/* ---------- Main endpoint ---------- */
+/* ---------- Main App Proxy endpoints ---------- */
 
 app.get("/image.xml", async (req,res)=>{
   try{
@@ -256,64 +264,96 @@ app.get("/image.xml", async (req,res)=>{
     const type=(req.query.type||"all").toLowerCase(); // products|collections|all
     const preferHost=String(req.query.prefer_host||"1")==="1";
     const locale=getLocaleForHost(host, req.query.locale);
+    const debug=String(req.query.debug||"0")==="1";
+
     const key=cacheKey({route:"image.xml",host,page,perPage,type,preferHost,locale});
-    const hit=responseCache.get(key); const now=Date.now();
+    const hit=responseCache.get(key);
+    const now=Date.now();
     if(hit && hit.expiresAt>now){ setXmlHeaders(res); return res.status(200).send(hit.body); }
 
     const offset=(page-1)*perPage;
     const nodes=[];
-    const useSF = !!STOREFRONT_TOKEN;
 
-    // PRODUCTS
+    // ----- PRODUCTS -----
     if(type==="products"||type==="all"){
-      const products = useSF
-        ? await sfGetProductsSlice(offset, perPage, locale)
-        : await getProductsSlice(offset, perPage);
+      const products=await getProductsSlice(offset, perPage);
 
-      for (const p of products){
-        const handle = p.handle;
-        const pageUrl = pageUrlForProduct(host, handle, p.onlineStoreUrl);
-        const updatedAt = p.updatedAt;
-        const imagesArr = useSF
-          ? (p.images?.nodes || [])
-          : ((p.images?.edges || []).map(e=>e.node));
+      // fetch translations in parallel
+      const prodTrans=await pMap(
+        products.map(p=>({ p, idNum:numericIdFromGid(p.id) })),
+        TRANS_CONCURRENCY,
+        async ({p,idNum})=>{
+          let trs=null;
+          if(idNum) trs=await fetchProductTranslations(idNum, locale);
+          return { id:p.id, trs };
+        }
+      );
+      const transMap=new Map(prodTrans.map(r=>[r.id, r.trs||[]]));
 
-        if(!imagesArr.length) continue;
+      for(const p of products){
+        const pageUrl=pageUrlForProduct(host, p.handle, p.onlineStoreUrl);
+        const images=(p.images?.edges||[]).map(e=>e.node);
+        if(!images.length) continue;
 
-        const productTitle = p.title || "";
-        const imageNodes = imagesArr.map(img=>{
+        const trs=transMap.get(p.id)||[];
+        const productTitleTr=extractTranslatedValue(trs,"title");
+        const imageAltMap=buildImageAltMapFromTranslations(trs);
+        const productTitleFallback = productTitleTr || p.title || "";
+
+        const imageNodes = images.map(img=>{
+          const imgIdNum=numericIdFromGid(img.id);
+          const translatedAlt = (imgIdNum && imageAltMap.get(imgIdNum)) || imageAltMap.get("*") || "";
+          const resolved = translatedAlt || productTitleFallback; // caption + title from FR alt or FR title
           const imgUrl = preferHost ? preferHostImageUrl(img.url, host) : img.url;
-          const resolved = img.altText || productTitle; // localized via SF; fallback to localized title
           return buildImageNode(imgUrl, resolved, resolved);
         });
 
-        nodes.push(buildUrlNode(pageUrl, updatedAt, imageNodes));
+        nodes.push(buildUrlNode(pageUrl, p.updatedAt, imageNodes));
       }
     }
 
-    // COLLECTIONS
+    // ----- COLLECTIONS -----
     if(type==="collections"||type==="all"){
-      const collections = useSF
-        ? await sfGetCollectionsSlice(offset, perPage, locale)
-        : await getCollectionsSlice(offset, perPage);
+      const collections=await getCollectionsSlice(offset, perPage);
 
-      for (const c of collections){
-        const handle = c.handle;
-        const pageUrl = pageUrlForCollection(host, handle);
-        const updatedAt = c.updatedAt;
+      const colTrans=await pMap(
+        collections.map(c=>({ c, idNum:numericIdFromGid(c.id) })),
+        TRANS_CONCURRENCY,
+        async ({c,idNum})=>{
+          let trs=null;
+          if(idNum) trs=await fetchCollectionTranslations(idNum, locale);
+          return { id:c.id, trs };
+        }
+      );
+      const transMap=new Map(colTrans.map(r=>[r.id, r.trs||[]]));
 
-        const imgObj = useSF ? c.image : c.image;
-        if (!imgObj?.url) continue;
+      for(const c of collections){
+        if(!c.image?.url) continue;
+        const pageUrl=pageUrlForCollection(host, c.handle);
 
-        const imgUrl = preferHost ? preferHostImageUrl(imgObj.url, host) : imgObj.url;
-        const resolved = imgObj.altText || c.title || "";
-        const imageNodes = [buildImageNode(imgUrl, resolved, resolved)];
+        const trs=transMap.get(c.id)||[];
+        const collectionTitleTr=extractTranslatedValue(trs,"title");
+        const imgIdNum=numericIdFromGid(c.image?.id);
 
-        nodes.push(buildUrlNode(pageUrl, updatedAt, imageNodes));
+        let imageAltTr="";
+        for(const t of trs){
+          if(!t?.key||!t?.value) continue;
+          if(t.key==="image.alt_text") imageAltTr=String(t.value);
+          const m=t.key.match(/^image\[(\d+)\]\.alt$/i);
+          if(m && imgIdNum && m[1]===String(imgIdNum)) imageAltTr=String(t.value);
+        }
+
+        const resolved = imageAltTr || collectionTitleTr || c.title || "";
+        const imgUrl = preferHost ? preferHostImageUrl(c.image.url, host) : c.image.url;
+        const imageNodes=[buildImageNode(imgUrl, resolved, resolved)];
+
+        nodes.push(buildUrlNode(pageUrl, c.updatedAt, imageNodes));
       }
     }
 
-    const xml=`<?xml version="1.0" encoding="UTF-8"?>
+    const debugComment = debug ? `\n<!-- locale=${locale} host=${host} type=${type} page=${page} per_page=${perPage} -->\n` : "";
+
+    const xml=`<?xml version="1.0" encoding="UTF-8"?>${debugComment}
 <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9"
         xmlns:image="http://www.google.com/schemas/sitemap-image/1.1">
 ${nodes.join("\n")}
@@ -329,4 +369,73 @@ ${nodes.join("\n")}
   }
 });
 
-/* Index, health, root stay as you have them */
+/* ---------- Diagnostics ---------- */
+
+// Simple echo — proves Shopify → Render routing works
+app.get("/echo", (req, res) => {
+  res
+    .status(200)
+    .type("text/plain")
+    .send(`echo ok | host=${req.get("x-forwarded-host") || req.get("host")} | path=${req.path}`);
+});
+
+// App Proxy HMAC self-test — validates SHARED_SECRET against the request
+app.get("/proxy-self-test", (req, res) => {
+  const ok = verifyProxyHmac(req);
+  res.status(ok ? 200 : 401).type("text/plain").send(ok ? "proxy hmac ok" : "proxy hmac invalid");
+});
+
+// Proxy signature debugger (leave off in production or protect it)
+app.get("/proxy-debug", (req, res) => {
+  const q = { ...req.query };
+  const given = (q.signature || q.sig || "").toString().toLowerCase();
+  delete q.signature; delete q.sig;
+  const payload = Object.keys(q).sort().map(k => `${k}=${q[k]}`).join("");
+  const expected = SHARED_SECRET
+    ? crypto.createHmac("sha256", SHARED_SECRET).update(payload).digest("hex").toLowerCase()
+    : "(SHARED_SECRET MISSING)";
+  res.type("text/plain").send(
+    [
+      `host: ${req.get("host")}`,
+      `path: ${req.path}`,
+      `payload: ${payload}`,
+      `expected signature: ${expected}`,
+      `given signature:    ${given}`,
+      `match: ${expected === given}`,
+    ].join("\n")
+  );
+});
+
+/* ---------- Index, health ---------- */
+app.get("/image-index.xml",(req,res)=>{
+  const forwardedHost=req.get("x-forwarded-host")||req.get("host");
+  const host=stripPort(forwardedHost);
+  const pages=Number(req.query.pages||5);
+  const type=String(req.query.type||"products");
+  const perPage=Number(req.query.per_page||DEFAULT_PER_PAGE);
+  const locale=req.query.locale?`&locale=${encodeURIComponent(req.query.locale)}`:"";
+
+  const urls=Array.from({length:pages},(_,i)=>i+1).map(
+    n=>`<sitemap><loc>https://${host}/apps/sitemaps/image.xml?type=${encodeURIComponent(type)}&page=${n}&per_page=${perPage}${locale}</loc></sitemap>`
+  );
+  const xml=`<?xml version="1.0" encoding="UTF-8"?>
+<sitemapindex xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+${urls.join("\n")}
+</sitemapindex>`;
+  setXmlHeaders(res);
+  return res.status(200).send(xml);
+});
+
+app.get("/health",(_req,res)=>res.type("text/plain").send("ok"));
+app.get("/",(_req,res)=>res.type("text/plain").send("Image Sitemap Proxy (hybrid) running."));
+
+/* ---------- Global error handler ---------- */
+app.use((err, _req, res, _next) => {
+  console.error("[unhandled]", err);
+  res.status(500).type("text/plain").send(`Server error: ${err?.message || "unknown"}`);
+});
+
+const port=process.env.PORT||3000;
+app.listen(port,()=>console.log(`Image sitemap proxy (hybrid) on :${port}`));
+
+
