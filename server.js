@@ -118,7 +118,6 @@ async function pMap(items, limit, mapper){
  * Robust cursor pagination:
  * 1) SKIP PHASE: advance by pages of `first` until we pass `offset` (no collecting)
  * 2) COLLECT PHASE: collect up to `take` items into `out`
- * This avoids edge-cases where interleaving skip/collect lost elements.
  */
 async function gqlPagedSlice({ query, selectEdges, selectPageInfo, first, offset, take, debug }) {
   let after = null;
@@ -136,7 +135,7 @@ async function gqlPagedSlice({ query, selectEdges, selectPageInfo, first, offset
     if(!resp.ok){ const text=await resp.text(); throw new Error(`Admin API ${resp.status}: ${text}`); }
     const json=await resp.json();
     const edges = selectEdges(json) || [];
-    if (!edges.length) break; // nothing more
+    if (!edges.length) break;
     skipped += edges.length;
     after = edges[edges.length-1].cursor;
     const pageInfo = selectPageInfo(json);
@@ -193,9 +192,9 @@ async function getProductsSlice(offset, limit, debug=false){
     query,
     selectEdges: j => j?.data?.products?.edges,
     selectPageInfo: j => j?.data?.products?.pageInfo,
-    first: 100,           // batch size to talk to Shopify
-    offset,               // skip this many nodes first
-    take: limit,          // then collect exactly this many
+    first: 100,
+    offset,
+    take: limit,
     debug
   });
 }
@@ -228,20 +227,53 @@ async function getCollectionsSlice(offset, limit, debug=false){
   });
 }
 
-/* ---------- Translations (Admin REST) ---------- */
+/* ---------- Translations (Admin REST) with multi-locale fallback ---------- */
 
-async function fetchProductTranslations(numericId, locale){
-  const url=`https://${SHOP}/admin/api/${API_VERSION}/translations.json?locale=${encodeURIComponent(locale)}&resource_type=Product&resource_id=${numericId}`;
-  const resp=await timedFetch(url,{ headers:{ "X-Shopify-Access-Token":ADMIN_API_TOKEN,"Content-Type":"application/json"}});
-  if(!resp.ok) return null;
-  const json=await resp.json(); return json?.translations||null;
+/** Expand a base locale (e.g. "fr") into likely candidates ("fr", "fr-FR", plus CH variants) */
+function expandLocaleCandidates(locale, host) {
+  const base = (locale || "en").toLowerCase();
+  const regionMap = {
+    fr: "FR", nl: "NL", it: "IT", de: "DE", es: "ES", pt: "PT",
+    pl: "PL", sv: "SE", fi: "FI", da: "DK", cs: "CZ", ro: "RO",
+    hu: "HU", el: "GR"
+  };
+  const candidates = [base];
+  const region = regionMap[base];
+  if (region) candidates.push(`${base}-${region}`);
+  if (host && host.toLowerCase().endsWith(".ch")) {
+    candidates.push(`${base}-CH`);
+  }
+  return Array.from(new Set(candidates));
 }
-async function fetchCollectionTranslations(numericId, locale){
-  const url=`https://${SHOP}/admin/api/${API_VERSION}/translations.json?locale=${encodeURIComponent(locale)}&resource_type=Collection&resource_id=${numericId}`;
-  const resp=await timedFetch(url,{ headers:{ "X-Shopify-Access-Token":ADMIN_API_TOKEN,"Content-Type":"application/json"}});
-  if(!resp.ok) return null;
-  const json=await resp.json(); return json?.translations||null;
+
+async function fetchProductTranslationsAnyLocale(numericId, locale, host){
+  const tried = [];
+  for (const loc of expandLocaleCandidates(locale, host)) {
+    const url = `https://${SHOP}/admin/api/${API_VERSION}/translations.json?locale=${encodeURIComponent(loc)}&resource_type=Product&resource_id=${numericId}`;
+    const resp = await timedFetch(url,{ headers:{ "X-Shopify-Access-Token":ADMIN_API_TOKEN,"Content-Type":"application/json"}});
+    if (!resp.ok) { tried.push({ loc, ok:false, status:resp.status }); continue; }
+    const json = await resp.json();
+    const trs = json?.translations || [];
+    if (trs.length) return { translations: trs, matchedLocale: loc, tried };
+    tried.push({ loc, ok:true, count: trs.length });
+  }
+  return { translations: null, matchedLocale: null, tried };
 }
+
+async function fetchCollectionTranslationsAnyLocale(numericId, locale, host){
+  const tried = [];
+  for (const loc of expandLocaleCandidates(locale, host)) {
+    const url = `https://${SHOP}/admin/api/${API_VERSION}/translations.json?locale=${encodeURIComponent(loc)}&resource_type=Collection&resource_id=${numericId}`;
+    const resp = await timedFetch(url,{ headers:{ "X-Shopify-Access-Token":ADMIN_API_TOKEN,"Content-Type":"application/json"}});
+    if (!resp.ok) { tried.push({ loc, ok:false, status:resp.status }); continue; }
+    const json = await resp.json();
+    const trs = json?.translations || [];
+    if (trs.length) return { translations: trs, matchedLocale: loc, tried };
+    tried.push({ loc, ok:true, count: trs.length });
+  }
+  return { translations: null, matchedLocale: null, tried };
+}
+
 function extractTranslatedValue(translations, keyExact){
   if(!translations) return "";
   for(const t of translations){ if(t.key===keyExact && t.value) return String(t.value); }
@@ -300,22 +332,24 @@ app.get("/image.xml", async (req,res)=>{
 
     const offset=(page-1)*perPage;
     const nodes=[];
+    const matchedLocalesSet = new Set();
 
     // ----- PRODUCTS -----
     let diag = { locale, host, page, perPage, type };
     if(type==="products"||type==="all"){
       const products=await getProductsSlice(offset, perPage, debug);
 
-      // fetch translations in parallel
+      // fetch translations (multi-locale) in parallel
       const prodTrans=await pMap(
         products.map(p=>({ p, idNum:numericIdFromGid(p.id) })), TRANS_CONCURRENCY,
         async ({p,idNum})=>{
-          let trs=null;
-          if(idNum) trs=await fetchProductTranslations(idNum, locale);
-          return { id:p.id, trs };
+          if(!idNum) return { id:p.id, trs:null, matched:null };
+          const { translations, matchedLocale } = await fetchProductTranslationsAnyLocale(idNum, locale, host);
+          return { id:p.id, trs: translations, matched: matchedLocale };
         }
       );
       const transMap=new Map(prodTrans.map(r=>[r.id, r.trs||[]]));
+      prodTrans.forEach(r => { if (r.matched) matchedLocalesSet.add(r.matched); });
 
       for(const p of products){
         const pageUrl=pageUrlForProduct(host, p.handle, p.onlineStoreUrl);
@@ -330,7 +364,7 @@ app.get("/image.xml", async (req,res)=>{
         const imageNodes = images.map(img=>{
           const imgIdNum=numericIdFromGid(img.id);
           const translatedAlt = (imgIdNum && imageAltMap.get(imgIdNum)) || imageAltMap.get("*") || "";
-          const resolved = translatedAlt || productTitleFallback; // caption+title from FR alt or FR title
+          const resolved = translatedAlt || productTitleFallback; // caption+title from localized alt or title
           const imgUrl = preferHost ? preferHostImageUrl(img.url, host) : img.url;
           return buildImageNode(imgUrl, resolved, resolved);
         });
@@ -348,12 +382,13 @@ app.get("/image.xml", async (req,res)=>{
       const colTrans=await pMap(
         collections.map(c=>({ c, idNum:numericIdFromGid(c.id) })), TRANS_CONCURRENCY,
         async ({c,idNum})=>{
-          let trs=null;
-          if(idNum) trs=await fetchCollectionTranslations(idNum, locale);
-          return { id:c.id, trs };
+          if(!idNum) return { id:c.id, trs:null, matched:null };
+          const { translations, matchedLocale } = await fetchCollectionTranslationsAnyLocale(idNum, locale, host);
+          return { id:c.id, trs: translations, matched: matchedLocale };
         }
       );
       const transMap=new Map(colTrans.map(r=>[r.id, r.trs||[]]));
+      colTrans.forEach(r => { if (r.matched) matchedLocalesSet.add(r.matched); });
 
       for(const c of collections){
         if(!c.image?.url) continue;
@@ -381,8 +416,9 @@ app.get("/image.xml", async (req,res)=>{
       if (debug && collections._debug) diag.collections_debug = collections._debug;
     }
 
+    const matchedLocalesStr = Array.from(matchedLocalesSet).join(",");
     const debugComment = debug
-      ? `\n<!-- ${Object.entries(diag).map(([k,v])=>`${k}=${v}`).join(" ")} -->\n`
+      ? `\n<!-- ${Object.entries({...diag, matched_locales: matchedLocalesStr}).map(([k,v])=>`${k}=${v}`).join(" ")} -->\n`
       : "";
 
     const xml=`<?xml version="1.0" encoding="UTF-8"?>${debugComment}
