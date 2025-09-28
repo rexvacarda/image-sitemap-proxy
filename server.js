@@ -87,11 +87,15 @@ function getLocaleForHost(host, override){
   const h=(host||"").toLowerCase();
   if (h.endsWith(".fr")) return "fr";
   if (h.endsWith(".it")) return "it";
+  if (h.endsWith(".jp")) return "ja";
   if (h.startsWith("ko.")) return "ko";
   if (h.startsWith("ar.")) return "ar";
   if (h.startsWith("iw.")) return "he";
   if (h.endsWith(".nl")) return "nl";
   if (h.endsWith(".ch")) return "de";
+  if (h.endsWith(".dk")) return "da";
+  if (h.endsWith(".pt")) return "pt-PT";
+  if (h.endsWith(".pl")) return "pl";
   return "en";
 }
 function numericIdFromGid(gid){ if(!gid) return null; const parts=String(gid).split("/"); return parts.length?parts[parts.length-1]:null; }
