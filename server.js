@@ -7,24 +7,26 @@ const app = express();
 
 /* ========= CONFIG via ENV (HYBRID) =========
 Required:
-  SHOP                -> e.g. smelltoimpress.myshopify.com
-  ADMIN_API_TOKEN     -> Admin API token (read_products, read_translations)
-  SHARED_SECRET       -> App Proxy "API secret key" from the Partner App (with App Proxy)
-
-Optional:
-  API_VERSION         -> default 2024-04
-  CACHE_TTL_SECONDS   -> default 900
-  MAX_URLS_PER_FEED   -> default 5000
-  DEFAULT_PER_PAGE    -> default 200
-  HTTP_TIMEOUT_MS     -> default 12000
-  TRANS_CONCURRENCY   -> default 8
-  DISABLE_HMAC        -> "1" to bypass proxy HMAC check (local testing only)
+  SHOP
+  ADMIN_API_TOKEN
+  SHARED_SECRET
+Optional (recommended):
+  STOREFRONT_TOKEN   -> enables fully localized fetch via Storefront API
+  SF_API_VERSION     -> default 2024-07
+  API_VERSION        -> default 2024-04
+  CACHE_TTL_SECONDS  -> default 900
+  MAX_URLS_PER_FEED  -> default 5000
+  DEFAULT_PER_PAGE   -> default 200
+  HTTP_TIMEOUT_MS    -> default 12000
+  TRANS_CONCURRENCY  -> default 8
+  DISABLE_HMAC       -> "1" to bypass proxy HMAC (local testing only)
 ============================================= */
 
 const SHOP = process.env.SHOP || "";
 const ADMIN_API_TOKEN = process.env.ADMIN_API_TOKEN || "";
 const SHARED_SECRET = process.env.SHARED_SECRET || "";
-const DISABLE_HMAC = String(process.env.DISABLE_HMAC || "0") === "1";
+const STOREFRONT_TOKEN = process.env.STOREFRONT_TOKEN || "";
+const SF_API_VERSION = process.env.SF_API_VERSION || "2024-07";
 
 const API_VERSION = process.env.API_VERSION || "2024-04";
 const CACHE_TTL_SECONDS = Number(process.env.CACHE_TTL_SECONDS || 900);
@@ -32,14 +34,9 @@ const MAX_URLS_PER_FEED = Number(process.env.MAX_URLS_PER_FEED || 5000);
 const DEFAULT_PER_PAGE = Math.min(Number(process.env.DEFAULT_PER_PAGE || 200), MAX_URLS_PER_FEED);
 const HTTP_TIMEOUT_MS = Number(process.env.HTTP_TIMEOUT_MS || 12000);
 const TRANS_CONCURRENCY = Math.max(1, Number(process.env.TRANS_CONCURRENCY || 8));
+const DISABLE_HMAC = String(process.env.DISABLE_HMAC || "0") === "1";
 
-if (!SHOP) console.error("[startup] Missing SHOP env");
-if (!ADMIN_API_TOKEN) console.error("[startup] Missing ADMIN_API_TOKEN env");
-if (!SHARED_SECRET) console.error("[startup] Missing SHARED_SECRET env");
-
-const responseCache = new Map(); // key -> { body, expiresAt }
-
-/* ---------- Utils ---------- */
+const responseCache = new Map();
 
 function cacheKey(parts){return Object.entries(parts).map(([k,v])=>`${k}=${v}`).sort().join("|");}
 function setXmlHeaders(res){res.set("Content-Type","application/xml; charset=utf-8");res.set("Cache-Control",`public, max-age=${CACHE_TTL_SECONDS}`);}
@@ -67,7 +64,7 @@ function pageUrlForCollection(host, handle){
   return `https://${h}/collections/${handle}`;
 }
 
-/** Hardened App Proxy HMAC check */
+/** Shopify App Proxy HMAC verify */
 function verifyProxyHmac(req){
   if (DISABLE_HMAC) return true;
   const query = { ...req.query };
@@ -80,19 +77,21 @@ function verifyProxyHmac(req){
     const a = Buffer.from(expected, "hex");
     const b = Buffer.from(provided, "hex");
     return a.length === b.length && crypto.timingSafeEqual(a, b);
-  } catch { return false; }
+  } catch {
+    return false;
+  }
 }
 
 function getLocaleForHost(host, override){
-  if(override) return override.toLowerCase();
+  if (override) return override.toLowerCase();
   const h=(host||"").toLowerCase();
-  if(h.endsWith(".fr")) return "fr";
-  if(h.endsWith(".it")) return "it";
-  if(h.startsWith("ko.")) return "ko";
-  if(h.startsWith("ar.")) return "ar";
-  if(h.startsWith("iw.")) return "he";
-  if(h.endsWith(".nl")) return "nl";
-  if(h.endsWith(".ch")) return "de";
+  if (h.endsWith(".fr")) return "fr";
+  if (h.endsWith(".it")) return "it";
+  if (h.startsWith("ko.")) return "ko";
+  if (h.startsWith("ar.")) return "ar";
+  if (h.startsWith("iw.")) return "he";
+  if (h.endsWith(".nl")) return "nl";
+  if (h.endsWith(".ch")) return "de";
   return "en";
 }
 function numericIdFromGid(gid){ if(!gid) return null; const parts=String(gid).split("/"); return parts.length?parts[parts.length-1]:null; }
@@ -101,76 +100,152 @@ async function timedFetch(url, opts={}, timeoutMs=HTTP_TIMEOUT_MS){
   try{return await fetch(url,{...opts,signal:c.signal});} finally{clearTimeout(t);}
 }
 async function pMap(items, limit, mapper){
-  const ret=[]; const executing=[];
+  const ret=[]; const running=[];
   for(const item of items){
     const p=Promise.resolve().then(()=>mapper(item));
     ret.push(p);
-    const e=p.then(()=>executing.splice(executing.indexOf(e),1));
-    executing.push(e);
-    if(executing.length>=limit) await Promise.race(executing);
+    const e=p.then(()=>running.splice(running.indexOf(e),1));
+    running.push(e);
+    if(running.length>=limit) await Promise.race(running);
   }
   return Promise.all(ret);
 }
 
-/* ---------- Admin API fetchers with robust pagination ---------- */
+/* ---------- Storefront API (localized) — FIXED PAGINATION ---------- */
+
+async function sfGraphQL(query, variables, acceptLanguage){
+  const resp = await timedFetch(`https://${SHOP}/api/${SF_API_VERSION}/graphql.json`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Shopify-Storefront-Access-Token": STOREFRONT_TOKEN,
+      ...(acceptLanguage ? { "Accept-Language": acceptLanguage } : {})
+    },
+    body: JSON.stringify({ query, variables })
+  });
+  if (!resp.ok) {
+    const text = await resp.text();
+    throw new Error(`Storefront API ${resp.status}: ${text}`);
+  }
+  return resp.json();
+}
 
 /**
- * Robust cursor pagination:
- * 1) SKIP PHASE: advance by pages of `first` until we pass `offset` (no collecting)
- * 2) COLLECT PHASE: collect up to `take` items into `out`
+ * Generic cursor pagination for Storefront edges:
+ * - Skip phase: advance by batches until we pass `offset`
+ * - Collect phase: collect exactly `take` items
  */
-async function gqlPagedSlice({ query, selectEdges, selectPageInfo, first, offset, take, debug }) {
+async function sfPagedSlice({ type, first, offset, take, acceptLanguage }) {
   let after = null;
   let skipped = 0;
   const out = [];
 
-  // --- Skip phase ---
+  // queries return edges { cursor node { ... } } + pageInfo
+  const isProducts = type === "products";
+  const query = isProducts
+    ? `
+      query($first:Int!, $after:String) {
+        products(first:$first, after:$after, sortKey:UPDATED_AT, reverse:true) {
+          edges {
+            cursor
+            node {
+              handle
+              title
+              onlineStoreUrl
+              updatedAt
+              images(first:50) { nodes { url altText } }
+            }
+          }
+          pageInfo { hasNextPage }
+        }
+      }`
+    : `
+      query($first:Int!, $after:String) {
+        collections(first:$first, after:$after, sortKey:UPDATED_AT, reverse:true) {
+          edges {
+            cursor
+            node {
+              handle
+              title
+              updatedAt
+              image { url altText }
+            }
+          }
+          pageInfo { hasNextPage }
+        }
+      }`;
+
+  const selectEdges = (json) =>
+    isProducts ? json?.data?.products?.edges || [] : json?.data?.collections?.edges || [];
+  const selectPageInfo = (json) =>
+    isProducts ? json?.data?.products?.pageInfo : json?.data?.collections?.pageInfo;
+
+  // --- Skip phase
   while (skipped < offset) {
     const want = Math.min(first, offset - skipped);
-    const resp = await timedFetch(`https://${SHOP}/admin/api/${API_VERSION}/graphql.json`,{
-      method:"POST",
-      headers:{ "X-Shopify-Access-Token":ADMIN_API_TOKEN,"Content-Type":"application/json"},
-      body:JSON.stringify({ query, variables:{ first: want, after }})
-    });
-    if(!resp.ok){ const text=await resp.text(); throw new Error(`Admin API ${resp.status}: ${text}`); }
-    const json=await resp.json();
-    const edges = selectEdges(json) || [];
+    const resp = await sfGraphQL(query, { first: want, after }, acceptLanguage);
+    const edges = selectEdges(resp);
     if (!edges.length) break;
     skipped += edges.length;
-    after = edges[edges.length-1].cursor;
-    const pageInfo = selectPageInfo(json);
-    if (!pageInfo?.hasNextPage) break;
+    after = edges[edges.length - 1].cursor;
+    const info = selectPageInfo(resp);
+    if (!info?.hasNextPage) break;
   }
 
-  // --- Collect phase ---
+  // --- Collect phase
   while (out.length < take) {
     const need = take - out.length;
     const want = Math.min(first, need);
-    const resp = await timedFetch(`https://${SHOP}/admin/api/${API_VERSION}/graphql.json`,{
-      method:"POST",
-      headers:{ "X-Shopify-Access-Token":ADMIN_API_TOKEN,"Content-Type":"application/json"},
-      body:JSON.stringify({ query, variables:{ first: want, after }})
-    });
-    if(!resp.ok){ const text=await resp.text(); throw new Error(`Admin API ${resp.status}: ${text}`); }
-    const json=await resp.json();
-    const edges = selectEdges(json) || [];
+    const resp = await sfGraphQL(query, { first: want, after }, acceptLanguage);
+    const edges = selectEdges(resp);
     if (!edges.length) break;
     for (const e of edges) {
       out.push(e.node);
       if (out.length >= take) break;
     }
-    after = edges[edges.length-1].cursor;
-    const pageInfo = selectPageInfo(json);
-    if (!pageInfo?.hasNextPage) break;
+    after = edges[edges.length - 1].cursor;
+    const info = selectPageInfo(resp);
+    if (!info?.hasNextPage) break;
   }
 
-  if (debug) {
-    out._debug = { skipped, collected: out.length };
+  return out;
+}
+
+// New SF helpers that use cursor pagination above
+async function sfGetProductsSlice(offset, limit, acceptLanguage){
+  // batch size for Storefront; 100 is safe
+  return sfPagedSlice({ type: "products", first: 100, offset, take: limit, acceptLanguage });
+}
+async function sfGetCollectionsSlice(offset, limit, acceptLanguage){
+  return sfPagedSlice({ type: "collections", first: 100, offset, take: limit, acceptLanguage });
+}
+
+/* ---------- Admin API (fallback) ---------- */
+
+async function gqlPagedSlice({ query, selectEdges, first, offset, take }){
+  let after=null; let skipped=0; const out=[];
+  while(out.length<take){
+    const resp=await timedFetch(`https://${SHOP}/admin/api/${API_VERSION}/graphql.json`,{
+      method:"POST",
+      headers:{ "X-Shopify-Access-Token":ADMIN_API_TOKEN,"Content-Type":"application/json"},
+      body:JSON.stringify({ query, variables:{ first, after }})
+    });
+    if(!resp.ok){ const text=await resp.text(); throw new Error(`Admin API ${resp.status}: ${text}`); }
+    const json=await resp.json();
+    const edges=selectEdges(json)||[];
+    if(!edges.length) break;
+    for(const e of edges){
+      if(skipped<offset) skipped+=1;
+      else if(out.length<take) out.push(e.node);
+    }
+    const pageInfo=edges.length?json.data[Object.keys(json.data)[0]].pageInfo:{hasNextPage:false};
+    if(!pageInfo?.hasNextPage||out.length>=take) break;
+    after=edges[edges.length-1].cursor;
   }
   return out;
 }
 
-async function getProductsSlice(offset, limit, debug=false){
+async function getProductsSlice(offset, limit){
   const query=`
     query Products($first:Int!, $after:String) {
       products(first:$first, after:$after, query:"status:active", sortKey:UPDATED_AT, reverse:true) {
@@ -188,18 +263,10 @@ async function getProductsSlice(offset, limit, debug=false){
         pageInfo { hasNextPage }
       }
     }`;
-  return gqlPagedSlice({
-    query,
-    selectEdges: j => j?.data?.products?.edges,
-    selectPageInfo: j => j?.data?.products?.pageInfo,
-    first: 100,
-    offset,
-    take: limit,
-    debug
-  });
+  return gqlPagedSlice({ query, selectEdges:j=>j?.data?.products?.edges, first:100, offset, take:limit });
 }
 
-async function getCollectionsSlice(offset, limit, debug=false){
+async function getCollectionsSlice(offset, limit){
   const query=`
     query Collections($first:Int!, $after:String) {
       collections(first:$first, after:$after, query:"published_status:published", sortKey:UPDATED_AT, reverse:true) {
@@ -216,79 +283,7 @@ async function getCollectionsSlice(offset, limit, debug=false){
         pageInfo { hasNextPage }
       }
     }`;
-  return gqlPagedSlice({
-    query,
-    selectEdges: j => j?.data?.collections?.edges,
-    selectPageInfo: j => j?.data?.collections?.pageInfo,
-    first: 200,
-    offset,
-    take: limit,
-    debug
-  });
-}
-
-/* ---------- Translations (Admin REST) with multi-locale fallback ---------- */
-
-/** Expand a base locale (e.g. "fr") into likely candidates ("fr", "fr-FR", plus CH variants) */
-function expandLocaleCandidates(locale, host) {
-  const base = (locale || "en").toLowerCase();
-  const regionMap = {
-    fr: "FR", nl: "NL", it: "IT", de: "DE", es: "ES", pt: "PT",
-    pl: "PL", sv: "SE", fi: "FI", da: "DK", cs: "CZ", ro: "RO",
-    hu: "HU", el: "GR"
-  };
-  const candidates = [base];
-  const region = regionMap[base];
-  if (region) candidates.push(`${base}-${region}`);
-  if (host && host.toLowerCase().endsWith(".ch")) {
-    candidates.push(`${base}-CH`);
-  }
-  return Array.from(new Set(candidates));
-}
-
-async function fetchProductTranslationsAnyLocale(numericId, locale, host){
-  const tried = [];
-  for (const loc of expandLocaleCandidates(locale, host)) {
-    const url = `https://${SHOP}/admin/api/${API_VERSION}/translations.json?locale=${encodeURIComponent(loc)}&resource_type=Product&resource_id=${numericId}`;
-    const resp = await timedFetch(url,{ headers:{ "X-Shopify-Access-Token":ADMIN_API_TOKEN,"Content-Type":"application/json"}});
-    if (!resp.ok) { tried.push({ loc, ok:false, status:resp.status }); continue; }
-    const json = await resp.json();
-    const trs = json?.translations || [];
-    if (trs.length) return { translations: trs, matchedLocale: loc, tried };
-    tried.push({ loc, ok:true, count: trs.length });
-  }
-  return { translations: null, matchedLocale: null, tried };
-}
-
-async function fetchCollectionTranslationsAnyLocale(numericId, locale, host){
-  const tried = [];
-  for (const loc of expandLocaleCandidates(locale, host)) {
-    const url = `https://${SHOP}/admin/api/${API_VERSION}/translations.json?locale=${encodeURIComponent(loc)}&resource_type=Collection&resource_id=${numericId}`;
-    const resp = await timedFetch(url,{ headers:{ "X-Shopify-Access-Token":ADMIN_API_TOKEN,"Content-Type":"application/json"}});
-    if (!resp.ok) { tried.push({ loc, ok:false, status:resp.status }); continue; }
-    const json = await resp.json();
-    const trs = json?.translations || [];
-    if (trs.length) return { translations: trs, matchedLocale: loc, tried };
-    tried.push({ loc, ok:true, count: trs.length });
-  }
-  return { translations: null, matchedLocale: null, tried };
-}
-
-function extractTranslatedValue(translations, keyExact){
-  if(!translations) return "";
-  for(const t of translations){ if(t.key===keyExact && t.value) return String(t.value); }
-  return "";
-}
-function buildImageAltMapFromTranslations(translations){
-  const map=new Map();
-  if(!translations) return map;
-  for(const t of translations){
-    if(!t?.key||!t?.value) continue;
-    if(t.key==="image.alt_text"){ map.set("*",String(t.value)); continue; }
-    const m=t.key.match(/^image\[(\d+)\]\.alt$/i);
-    if(m) map.set(m[1],String(t.value));
-  }
-  return map;
+  return gqlPagedSlice({ query, selectEdges:j=>j?.data?.collections?.edges, first:200, offset, take:limit });
 }
 
 /* ---------- XML builders ---------- */
@@ -323,105 +318,59 @@ app.get("/image.xml", async (req,res)=>{
     const type=(req.query.type||"all").toLowerCase(); // products|collections|all
     const preferHost=String(req.query.prefer_host||"1")==="1";
     const locale=getLocaleForHost(host, req.query.locale);
-    const debug=String(req.query.debug||"0")==="1";
-
     const key=cacheKey({route:"image.xml",host,page,perPage,type,preferHost,locale});
-    const hit=responseCache.get(key);
-    const now=Date.now();
+    const hit=responseCache.get(key); const now=Date.now();
     if(hit && hit.expiresAt>now){ setXmlHeaders(res); return res.status(200).send(hit.body); }
 
     const offset=(page-1)*perPage;
     const nodes=[];
-    const matchedLocalesSet = new Set();
+    const useSF = !!STOREFRONT_TOKEN;
 
-    // ----- PRODUCTS -----
-    let diag = { locale, host, page, perPage, type };
+    // PRODUCTS
     if(type==="products"||type==="all"){
-      const products=await getProductsSlice(offset, perPage, debug);
+      const products = useSF
+        ? await sfGetProductsSlice(offset, perPage, locale)
+        : await getProductsSlice(offset, perPage);
 
-      // fetch translations (multi-locale) in parallel
-      const prodTrans=await pMap(
-        products.map(p=>({ p, idNum:numericIdFromGid(p.id) })), TRANS_CONCURRENCY,
-        async ({p,idNum})=>{
-          if(!idNum) return { id:p.id, trs:null, matched:null };
-          const { translations, matchedLocale } = await fetchProductTranslationsAnyLocale(idNum, locale, host);
-          return { id:p.id, trs: translations, matched: matchedLocale };
-        }
-      );
-      const transMap=new Map(prodTrans.map(r=>[r.id, r.trs||[]]));
-      prodTrans.forEach(r => { if (r.matched) matchedLocalesSet.add(r.matched); });
+      for (const p of products){
+        const handle = p.handle;
+        const pageUrl = pageUrlForProduct(host, handle, p.onlineStoreUrl);
+        const updatedAt = p.updatedAt;
+        const imagesArr = useSF ? (p.images?.nodes || []) : ((p.images?.edges || []).map(e=>e.node));
+        if(!imagesArr.length) continue;
 
-      for(const p of products){
-        const pageUrl=pageUrlForProduct(host, p.handle, p.onlineStoreUrl);
-        const images=(p.images?.edges||[]).map(e=>e.node);
-        if(!images.length) continue;
-
-        const trs=transMap.get(p.id)||[];
-        const productTitleTr=extractTranslatedValue(trs,"title");
-        const imageAltMap=buildImageAltMapFromTranslations(trs);
-        const productTitleFallback = productTitleTr || p.title || "";
-
-        const imageNodes = images.map(img=>{
-          const imgIdNum=numericIdFromGid(img.id);
-          const translatedAlt = (imgIdNum && imageAltMap.get(imgIdNum)) || imageAltMap.get("*") || "";
-          const resolved = translatedAlt || productTitleFallback; // caption+title from localized alt or title
+        const localizedTitle = p.title || "";
+        const imageNodes = imagesArr.map(img=>{
           const imgUrl = preferHost ? preferHostImageUrl(img.url, host) : img.url;
+          const resolved = (img.altText && img.altText.trim()) ? img.altText : localizedTitle;
           return buildImageNode(imgUrl, resolved, resolved);
         });
 
-        nodes.push(buildUrlNode(pageUrl, p.updatedAt, imageNodes));
+        nodes.push(buildUrlNode(pageUrl, updatedAt, imageNodes));
       }
-
-      if (debug && products._debug) diag.products_debug = products._debug;
     }
 
-    // ----- COLLECTIONS -----
+    // COLLECTIONS
     if(type==="collections"||type==="all"){
-      const collections=await getCollectionsSlice(offset, perPage, debug);
+      const collections = useSF
+        ? await sfGetCollectionsSlice(offset, perPage, locale)
+        : await getCollectionsSlice(offset, perPage);
 
-      const colTrans=await pMap(
-        collections.map(c=>({ c, idNum:numericIdFromGid(c.id) })), TRANS_CONCURRENCY,
-        async ({c,idNum})=>{
-          if(!idNum) return { id:c.id, trs:null, matched:null };
-          const { translations, matchedLocale } = await fetchCollectionTranslationsAnyLocale(idNum, locale, host);
-          return { id:c.id, trs: translations, matched: matchedLocale };
-        }
-      );
-      const transMap=new Map(colTrans.map(r=>[r.id, r.trs||[]]));
-      colTrans.forEach(r => { if (r.matched) matchedLocalesSet.add(r.matched); });
+      for (const c of collections){
+        const pageUrl = pageUrlForCollection(host, c.handle);
+        const updatedAt = c.updatedAt;
+        const imgObj = c.image;
+        if (!imgObj?.url) continue;
 
-      for(const c of collections){
-        if(!c.image?.url) continue;
-        const pageUrl=pageUrlForCollection(host, c.handle);
+        const imgUrl = preferHost ? preferHostImageUrl(imgObj.url, host) : imgObj.url;
+        const resolved = (imgObj.altText && imgObj.altText.trim()) ? imgObj.altText : (c.title || "");
+        const imageNodes = [buildImageNode(imgUrl, resolved, resolved)];
 
-        const trs=transMap.get(c.id)||[];
-        const collectionTitleTr=extractTranslatedValue(trs,"title");
-        const imgIdNum=numericIdFromGid(c.image?.id);
-
-        let imageAltTr="";
-        for(const t of trs){
-          if(!t?.key||!t?.value) continue;
-          if(t.key==="image.alt_text") imageAltTr=String(t.value);
-          const m=t.key.match(/^image\[(\d+)\]\.alt$/i);
-          if(m && imgIdNum && m[1]===String(imgIdNum)) imageAltTr=String(t.value);
-        }
-
-        const resolved = imageAltTr || collectionTitleTr || c.title || "";
-        const imgUrl = preferHost ? preferHostImageUrl(c.image.url, host) : c.image.url;
-        const imageNodes=[buildImageNode(imgUrl, resolved, resolved)];
-
-        nodes.push(buildUrlNode(pageUrl, c.updatedAt, imageNodes));
+        nodes.push(buildUrlNode(pageUrl, updatedAt, imageNodes));
       }
-
-      if (debug && collections._debug) diag.collections_debug = collections._debug;
     }
 
-    const matchedLocalesStr = Array.from(matchedLocalesSet).join(",");
-    const debugComment = debug
-      ? `\n<!-- ${Object.entries({...diag, matched_locales: matchedLocalesStr}).map(([k,v])=>`${k}=${v}`).join(" ")} -->\n`
-      : "";
-
-    const xml=`<?xml version="1.0" encoding="UTF-8"?>${debugComment}
+    const xml=`<?xml version="1.0" encoding="UTF-8"?>
 <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9"
         xmlns:image="http://www.google.com/schemas/sitemap-image/1.1">
 ${nodes.join("\n")}
@@ -437,7 +386,17 @@ ${nodes.join("\n")}
   }
 });
 
-/** Proxy signature debugger */
+/* ---------- Diagnostics ---------- */
+
+app.get("/echo", (req, res) => {
+  res.status(200).type("text/plain").send(`echo ok | host=${req.get("x-forwarded-host") || req.get("host")} | path=${req.path}`);
+});
+
+app.get("/proxy-self-test", (req, res) => {
+  const ok = verifyProxyHmac(req);
+  res.status(ok ? 200 : 401).type("text/plain").send(ok ? "proxy hmac ok" : "proxy hmac invalid");
+});
+
 app.get("/proxy-debug", (req, res) => {
   const q = { ...req.query };
   const given = (q.signature || q.sig || "").toString().toLowerCase();
@@ -448,42 +407,46 @@ app.get("/proxy-debug", (req, res) => {
     : "(SHARED_SECRET MISSING)";
   res.type("text/plain").send(
     [
-      `host=${req.get("host")}`,
-      `path=${req.path}`,
-      `payload=${payload}`,
-      `expected=${expected}`,
-      `given=${given}`,
-      `match=${expected === given}`,
+      `host: ${req.get("host")}`,
+      `path: ${req.path}`,
+      `payload: ${payload}`,
+      `expected signature: ${expected}`,
+      `given signature:    ${given}`,
+      `match: ${expected === given}`,
     ].join("\n")
   );
 });
 
-/* ---------- Sitemap index (with proper escaping) ---------- */
+/* ---------- Index, health ---------- */
 app.get("/image-index.xml",(req,res)=>{
-  const forwardedHost=req.get("x-forwarded-host")||req.get("host");
-  const host=stripPort(forwardedHost);
-  const pages=Math.max(Number(req.query.pages||5),1);
-  const type=String(req.query.type||"products");
-  const perPage=Math.max(Number(req.query.per_page||DEFAULT_PER_PAGE),1);
-  const locale= req.query.locale ? `&locale=${encodeURIComponent(req.query.locale)}` : "";
+  const forwardedHost = req.get("x-forwarded-host") || req.get("host");
+  const host = stripPort(forwardedHost);
+  const pages = Number(req.query.pages || 5);
+  const type = String(req.query.type || "products");
+  const perPage = Number(req.query.per_page || DEFAULT_PER_PAGE);
+  const localeParam = req.query.locale ? `&locale=${encodeURIComponent(req.query.locale)}` : "";
 
-  const urls=[];
-  for(let n=1;n<=pages;n++){
-    const loc=`https://${host}/apps/sitemaps/image.xml?type=${encodeURIComponent(type)}&page=${n}&per_page=${perPage}${locale}`;
-    urls.push(`<sitemap><loc>${x(loc)}</loc></sitemap>`);
-  }
+  const items = Array.from({ length: pages }, (_, i) => i + 1).map((n) => {
+    const rawUrl = `https://${host}/apps/sitemaps/image.xml?type=${encodeURIComponent(type)}&page=${n}&per_page=${perPage}${localeParam}`;
+    return `<sitemap><loc>${x(rawUrl)}</loc></sitemap>`;
+  });
 
-  const xml=`<?xml version="1.0" encoding="UTF-8"?>
+  const xml = `<?xml version="1.0" encoding="UTF-8"?>
 <sitemapindex xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
-${urls.join("\n")}
+${items.join("\n")}
 </sitemapindex>`;
+
   setXmlHeaders(res);
   return res.status(200).send(xml);
 });
 
-// Health & root
 app.get("/health",(_req,res)=>res.type("text/plain").send("ok"));
-app.get("/",(_req,res)=>res.type("text/plain").send("Image Sitemap Proxy (hybrid) running. Use /apps/sitemaps/image.xml"));
+app.get("/",(_req,res)=>res.type("text/plain").send("Image Sitemap Proxy (hybrid) running."));
+
+app.use((err, _req, res, _next) => {
+  console.error("[unhandled]", err);
+  res.status(500).type("text/plain").send(`Server error: ${err?.message || "unknown"}`);
+});
 
 const port=process.env.PORT||3000;
 app.listen(port,()=>console.log(`Image sitemap proxy (hybrid) on :${port}`));
