@@ -82,22 +82,35 @@ function verifyProxyHmac(req){
   }
 }
 
-function getLocaleForHost(host, override){
-  if (override) return override.toLowerCase();
-  const h=(host||"").toLowerCase();
+function getLocaleForHost(host, override) {
+  // If caller forces a locale, respect it as-is (hreflang is case-insensitive anyway).
+  if (override) return override;
+
+  const h = (host || "").toLowerCase();
+
+  // --- Chinese (use script tags) ---
+  // You said TW currently serves Simplified too → map TW to zh-Hans for now.
+  if (h.startsWith("zh-cn.") || h.endsWith(".cn")) return "zh-Hans";      // Mainland content (Simplified)
+  if (h.startsWith("zh-tw.") || h.endsWith(".tw") || h.endsWith(".com.tw")) return "zh-Hans"; // TW but Simplified on your site
+  if (h.startsWith("zh-hk.") || h.endsWith(".hk") || h.endsWith(".com.hk")) return "zh-Hant";  // HK (Traditional)
+  if (h.startsWith("zh-sg.") || h.endsWith(".sg") || h.endsWith(".com.sg")) return "zh-Hans";  // SG (Simplified)
+
+  // --- Single-language ccTLDs / subdomains ---
   if (h.endsWith(".fr")) return "fr";
   if (h.endsWith(".it")) return "it";
   if (h.endsWith(".jp")) return "ja";
   if (h.startsWith("ko.")) return "ko";
   if (h.startsWith("ar.")) return "ar";
-  if (h.startsWith("iw.")) return "he";
+  if (h.startsWith("iw.")) return "he"; // legacy "iw" → modern "he"
   if (h.endsWith(".nl")) return "nl";
-  if (h.endsWith(".ch")) return "de";
+  if (h.endsWith(".ch")) return "de";   // default Swiss to German; adjust if you add fr/it locales
   if (h.endsWith(".dk")) return "da";
   if (h.endsWith(".pt")) return "pt-PT";
   if (h.endsWith(".pl")) return "pl";
+
   return "en";
 }
+
 function numericIdFromGid(gid){ if(!gid) return null; const parts=String(gid).split("/"); return parts.length?parts[parts.length-1]:null; }
 async function timedFetch(url, opts={}, timeoutMs=HTTP_TIMEOUT_MS){
   const c=new AbortController(); const t=setTimeout(()=>c.abort(),timeoutMs);
