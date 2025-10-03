@@ -1501,9 +1501,10 @@ app.get('/admin/campaign/new', (req, res) => {
   `);
 });
 
+// --- debug: list all registered routes (temp) ---
 app.get('/__routes', (_req, res) => {
   const routes = [];
-  app._router.stack.forEach((m) => {
+  (app._router?.stack || []).forEach((m) => {
     if (m.route && m.route.path) {
       const methods = Object.keys(m.route.methods).join(',').toUpperCase();
       routes.push(`${methods} ${m.route.path}`);
@@ -1511,6 +1512,9 @@ app.get('/__routes', (_req, res) => {
   });
   res.type('text').send(routes.sort().join('\n'));
 });
+
+// --- debug: tiny sanity route (temp) ---
+app.get('/zzz-campaign-check', (_req, res) => res.send('campaign block is present'));
 
 // Create campaign handler
 app.post('/admin/campaign/create', (req, res) => {
