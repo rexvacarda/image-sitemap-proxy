@@ -107,14 +107,14 @@ db.serialize(() => {
     }
   });
 
-  // === ADDED 1): email_campaigns table =======================================
+  // === email_campaigns table =======================================
   db.run(`
     CREATE TABLE IF NOT EXISTS email_campaigns (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       name TEXT,
       subject TEXT NOT NULL,
       html TEXT NOT NULL,
-      segment TEXT,                 -- e.g. 'en-gb' (blank => all)
+      segment TEXT,                 -- e.g. 'en-gb' (NULL/blank => all)
       per_hour_limit INTEGER DEFAULT 500,
       total_cap INTEGER DEFAULT 100000,     -- safety cap
       sent_count INTEGER DEFAULT 0,
@@ -123,10 +123,14 @@ db.serialize(() => {
       since_id INTEGER DEFAULT 0,   -- resume cursor for Shopify REST
       status TEXT DEFAULT 'active', -- 'active' | 'paused' | 'done' | 'cancelled'
       last_run_at TEXT,             -- last batch run timestamp
-      lock_until TEXT,              -- soft lock to avoid concurrent runs
+      lock_until TEXT,              -- soft lock to avoid concurrent runs (SQLite datetime)
       created_at TEXT DEFAULT (datetime('now'))
     )
   `);
+
+  // Helpful indexes
+  db.run(`CREATE INDEX IF NOT EXISTS idx_campaign_status ON email_campaigns(status)`);
+  db.run(`CREATE INDEX IF NOT EXISTS idx_campaign_since ON email_campaigns(since_id)`);
 });
 
 // ---------- Helpers ----------
@@ -538,7 +542,7 @@ function buildEmail(locale, title, claimLink) {
       ctaLead: `Spustelėkite žemiau, kad atsiimtumėte prizą:`,
       cta: `Atsiimti prizą`,
       reply: `Atsakykite į šį el. laišką, kad atsiimtumėte prizą.`,
-      copyHelp: `Jei mygtukas neveikia, nukopijuokite šią nuorodą:`
+      copyHelp: `Jei mygtukas neveikia, nukopijuokite šią nuorodę:`
     },
     hr: {
       subject: `Pobijedili ste: ${title}!`,
@@ -668,7 +672,7 @@ function buildEntryConfirmEmail(locale, title) {
                <p>Arvonta suoritetaan määräaikana ja voittajalle lähetetään sähköposti.</p>
              </div>`
     }
-};
+  };
   const pack = t[l] || t[s] || t.en;
   return { subject: pack.subject, html: pack.body };
 }
@@ -744,25 +748,22 @@ function pickLoc(str, fallback = 'en') {
 }
 function sub(tpl, vars) { return tpl.replace(/{{\s*(\w+)\s*}}/g, (_, k) => (vars[k] ?? '')); }
 
-// === ADDED 2): tiny helpers for campaign locking =============================
-function nowSqlite() {
-  return new Date().toISOString().replace('T',' ').replace('Z','');
-}
-
+// === Campaign locking helpers ==================================
 async function acquireCampaignLock(id, ms = 4 * 60 * 1000) {
+  // Use SQLite datetime math so comparisons with datetime('now') are valid
   return new Promise(resolve => {
-    const until = new Date(Date.now() + ms).toISOString();
+    const seconds = Math.max(1, Math.floor(ms / 1000));
     db.run(`
       UPDATE email_campaigns
-      SET lock_until = ?
-      WHERE id = ? AND (lock_until IS NULL OR lock_until < datetime('now'))
-    `, [until, id], function (err) {
+      SET lock_until = datetime('now', '+' || ? || ' seconds')
+      WHERE id = ?
+        AND (lock_until IS NULL OR lock_until < datetime('now'))
+    `, [seconds, id], function (err) {
       if (err) return resolve(false);
       resolve(this.changes > 0);
     });
   });
 }
-
 function releaseCampaignLock(id) {
   db.run(`UPDATE email_campaigns SET lock_until = NULL WHERE id = ?`, [id], () => {});
 }
@@ -1222,21 +1223,16 @@ app.get('/admin/lotteries', (req, res) => {
     LEFT JOIN lastw ON lastw.productId = p.productId
     LEFT JOIN winners w ON w.productId = p.productId AND w.drawnAt = lastw.lastDraw
     ORDER BY
-  -- 1) active first (endAt is NULL/empty or in the future), then finished
   CASE
     WHEN p.endAt IS NULL OR p.endAt = '' OR datetime(p.endAt) > ${NOW_SQL} THEN 0
     ELSE 1
   END ASC,
-
-  -- 2) within "active": earlier deadlines first; NULL/empty last
   CASE
     WHEN p.endAt IS NULL OR p.endAt = '' THEN 1 ELSE 0
   END ASC,
   CASE
     WHEN datetime(p.endAt) > ${NOW_SQL} THEN datetime(p.endAt)
   END ASC,
-
-  -- 3) within "finished": later deadlines first
   CASE
     WHEN p.endAt IS NOT NULL AND p.endAt <> '' AND datetime(p.endAt) <= ${NOW_SQL} THEN datetime(p.endAt)
   END DESC
@@ -1338,9 +1334,7 @@ async function fetchShopifyCustomers({ limit = 250, since_id = 0 } = {}) {
   // read call-limit header (optional: log/slow further if near ceiling)
   const callLim = r.headers.get('X-Shopify-Shop-Api-Call-Limit'); // e.g. "1/40"
   if (callLim) {
-    // If you want to be extra careful, you can parse and add an extra sleep when near the bucket limit.
-    // const [used, cap] = callLim.split('/').map(Number);
-    // if (used > cap - 5) await sleep(800);
+    // Optional: parse and add extra sleep if near the bucket limit
   }
 
   const data = await r.json();
@@ -1377,56 +1371,56 @@ app.post('/admin/email', async (req, res) => {
       if (!batch.length) break;
       since_id = batch[batch.length - 1].id;
       await sleep(600); // ~0.6s cushion between Shopify API pages
-for (const c of batch) {
-  const email = normEmail(c.email);
-  if (!email) continue;
+      for (const c of batch) {
+        const email = normEmail(c.email);
+        if (!email) continue;
 
-  // Normalize customer.locale
-  const rawLocale = String(c.locale || '').trim();
-  const locale = rawLocale.toLowerCase().replace('_', '-'); // e.g. "en-gb"
-  const lang = (locale.split('-')[0] || '').trim();         // e.g. "en"
+        // Normalize customer.locale
+        const rawLocale = String(c.locale || '').trim();
+        const locale = rawLocale.toLowerCase().replace('_', '-'); // e.g. "en-gb"
+        const lang = (locale.split('-')[0] || '').trim();         // e.g. "en"
 
-  // Normalize tags (Shopify REST gives comma-separated string)
-  const tags = String(c.tags || '')
-    .split(',')
-    .map(s => s.trim())
-    .filter(Boolean)
-    .map(t => t.toLowerCase().replace('_', '-'));
+        // Normalize tags (Shopify REST gives comma-separated string)
+        const tags = String(c.tags || '')
+          .split(',')
+          .map(s => s.trim())
+          .filter(Boolean)
+          .map(t => t.toLowerCase().replace('_', '-'));
 
-  // Pull language from tags: prefer "lang-en"/"lang_en" (now normalized to lang-en), else bare "en"
-  let langFromTags = '';
-  const taggedLang = tags.find(t => /^lang-[a-z]{2}$/i.test(t));
-  if (taggedLang) langFromTags = taggedLang.replace(/^lang-/, '');
-  if (!langFromTags) {
-    const bare = tags.find(t => /^[a-z]{2}$/i.test(t));
-    if (bare) langFromTags = bare;
-  }
+        // Pull language from tags: prefer "lang-en"/"lang_en" (now normalized to lang-en), else bare "en"
+        let langFromTags = '';
+        const taggedLang = tags.find(t => /^lang-[a-z]{2}$/i.test(t));
+        if (taggedLang) langFromTags = taggedLang.replace(/^lang-/, '');
+        if (!langFromTags) {
+          const bare = tags.find(t => /^[a-z]{2}$/i.test(t));
+          if (bare) langFromTags = bare;
+        }
 
-  // accept things like en-gb, en-sti, en-us-east, etc.
-  const fullLocalesFromTags = tags.filter(t => /^[a-z]{2}-[a-z0-9-]{2,}$/i.test(t));
-  const baseFromFullTags = fullLocalesFromTags.map(t => t.slice(0, 2)); // ["en", "pt", ...]
+        // accept things like en-gb, en-sti, en-us-east, etc.
+        const fullLocalesFromTags = tags.filter(t => /^[a-z]{2}-[a-z0-9-]{2,}$/i.test(t));
+        const baseFromFullTags = fullLocalesFromTags.map(t => t.slice(0, 2)); // ["en", "pt", ...]
 
-  // Build a set of all candidates that should satisfy the segment
-  const candidates = new Set(
-  [lang, locale, langFromTags, ...fullLocalesFromTags, ...baseFromFullTags, ...tags].filter(Boolean)
-);
+        // Build a set of all candidates that should satisfy the segment
+        const candidates = new Set(
+          [lang, locale, langFromTags, ...fullLocalesFromTags, ...baseFromFullTags, ...tags].filter(Boolean)
+        );
 
-  // Apply segment filter:
-  // - segment "en" matches any of: "en", "en-gb", "en-us", tags "en"/"lang-en"/"en-gb"
-  // - segment "en-gb" matches only "en-gb" (or tag "en-gb")
-  if (segment && !candidates.has(segment)) continue;
+        // Apply segment filter:
+        // - segment "en" matches "en", "en-gb", "en-us", tags "en"/"lang-en"/"en-gb"
+        // - segment "en-gb" matches only "en-gb" (or tag "en-gb")
+        if (segment && !candidates.has(segment)) continue;
 
-  // Choose an effective locale to record/preview
-  const effective =
-    locale ||
-    (fullLocalesFromTags[0] || '') ||
-    lang ||
-    (langFromTags || '') ||
-    'en';
+        // Choose an effective locale to record/preview
+        const effective =
+          locale ||
+          (fullLocalesFromTags[0] || '') ||
+          lang ||
+          (langFromTags || '') ||
+          'en';
 
-  toSend.push({ id: c.id, email, locale: effective });
-  if (toSend.length >= limit) break;
-}   
+        toSend.push({ id: c.id, email, locale: effective });
+        if (toSend.length >= limit) break;
+      }
     }
 
     if (dryRun) {
@@ -1473,7 +1467,7 @@ for (const c of batch) {
   }
 });
 
-// === ADDED 3): Admin UI to create/list campaigns ==============================
+// === Admin UI to create/list campaigns ==============================
 // Create campaign form
 app.get('/admin/campaign/new', (req, res) => {
   if (!isAdmin(req)) return res.status(403).send('Forbidden');
@@ -1487,7 +1481,7 @@ app.get('/admin/campaign/new', (req, res) => {
         <input name="name" style="width:100%;padding:8px" placeholder="October UK promo"><br><br>
 
         <label>Segment (e.g. en-gb; blank = all)</label><br>
-        <input name="segment" style="width:240px;padding:8px" value="en-gb"><br><br>
+        <input name="segment" style="width:240px;padding:8px" value=""><br><br>
 
         <label>Per-hour send limit</label><br>
         <input type="number" name="per_hour_limit" value="500" min="1" max="5000" style="width:160px;padding:8px"><br><br>
@@ -1547,7 +1541,7 @@ app.get('/admin/campaigns', (req, res) => {
   });
 });
 
-// === ADDED 4): Hourly campaign runner ========================================
+// === Hourly campaign runner ========================================
 app.get('/admin/campaign/run', async (req, res) => {
   if (!isAdmin(req)) return res.status(403).send('Forbidden');
   const id = Number(req.query.id || 0);
@@ -1663,70 +1657,6 @@ app.get('/admin/campaign/run', async (req, res) => {
     }
   });
 });
-// --- ADMIN: simple "New Campaign" page (reuses /admin/email sender) ---
-app.get('/admin/campaign/new', async (req, res) => {
-  if (!isAdmin(req)) return res.status(403).send('Forbidden');
-
-  // Optional: show locale counts from Shopify so choosing a segment is easier
-  let localeCountsHtml = '';
-  try {
-    const rows = await fetchAllSubscribedCustomersFromShopify();
-    const counts = {};
-    for (const r of rows) counts[r.short_locale || 'en'] = (counts[r.short_locale || 'en'] || 0) + 1;
-    const items = Object.entries(counts)
-      .sort((a,b) => a[0].localeCompare(b[0]))
-      .map(([loc, n]) => `<option value="${loc}">${loc} (${n})</option>`)
-      .join('');
-    localeCountsHtml = `
-      <label>Segment (optional):</label>
-      <select name="segment" style="padding:8px;width:260px">
-        <option value="">All customers</option>
-        ${items}
-      </select>`;
-  } catch {
-    // If Shopify look-up fails, just show a free text input for segment
-    localeCountsHtml = `
-      <label>Segment (optional, e.g. "en" or "de"):</label>
-      <input name="segment" placeholder="en, de, fr..." style="padding:8px;width:260px">`;
-  }
-
-  res.send(`
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <div style="max-width:900px;margin:24px auto;font:16px/1.45 Arial,sans-serif;color:#222">
-      <h2 style="margin:0 0 12px">New Campaign</h2>
-      <form method="POST" action="/admin/email">
-        <input type="hidden" name="pass" value="${(req.query.pass || '')}">
-        <div style="margin:12px 0">
-          ${localeCountsHtml}
-        </div>
-        <div style="margin:12px 0">
-          <label>Subject</label><br>
-          <input name="subject" required style="width:100%;padding:10px" placeholder="Your subject">
-        </div>
-        <div style="margin:12px 0">
-          <label>HTML</label><br>
-          <textarea name="html" required rows="14" style="width:100%;padding:10px;font-family:monospace"></textarea>
-          <small style="color:#666;display:block">We’ll append the unsubscribe footer + add a List-Unsubscribe header.</small>
-        </div>
-
-        <div style="display:flex;gap:12px;flex-wrap:wrap;margin:12px 0">
-          <label>Max recipients (this run):
-            <input type="number" name="limit" value="500" min="1" max="10000" style="width:120px;padding:8px">
-          </label>
-          <label>Start after customer ID:
-            <input type="number" name="since_id" value="0" style="width:160px;padding:8px">
-          </label>
-          <label><input type="checkbox" name="dry" checked> Dry run (preview only)</label>
-          <label>Test to (optional email):
-            <input type="email" name="test_to" placeholder="you@example.com" style="width:220px;padding:8px">
-          </label>
-        </div>
-
-        <button type="submit" style="padding:10px 16px;background:#111;color:#fff;border:0;border-radius:6px">Send</button>
-      </form>
-    </div>
-  `);
-});
 
 // Optional convenience redirect so /campaign/new works too
 app.get('/campaign/new', (req, res) => {
@@ -1784,3 +1714,4 @@ app.get('/health', (_req, res) => res.json({ ok: true, service: 'lottery+bis', v
 app.listen(port, host, () => {
   console.log(`✅ Lottery/BIS server listening on ${host}:${port}`);
 });
+
