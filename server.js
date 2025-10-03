@@ -542,7 +542,7 @@ function buildEmail(locale, title, claimLink) {
       ctaLead: `Spustelėkite žemiau, kad atsiimtumėte prizą:`,
       cta: `Atsiimti prizą`,
       reply: `Atsakykite į šį el. laišką, kad atsiimtumėte prizą.`,
-      copyHelp: `Jei mygtukas neveikia, nukopijuokite šią nuorodę:`
+      copyHelp: `Jei mygtukas neveikia, nukopijuokite šią nuorodą:`
     },
     hr: {
       subject: `Pobijedili ste: ${title}!`,
@@ -662,7 +662,7 @@ function buildEntryConfirmEmail(locale, title) {
       subject: `Du er med: ${title}`,
       body: `<div style="font-family:Arial,sans-serif;font-size:16px;color:#333">
                <p>Takk — påmeldingen din til <strong>${title}</strong> er bekreftet.</p>
-               <p>Vi trekker en vinner ved fristen og sender e-post til vinneren.</p>
+               <p>Vi trekker en vinner ved fristen och skickar e-post till vinnaren.</p>
              </div>`
     },
     fi: {
@@ -715,29 +715,29 @@ const BIS_I18N = {
       </div>`,
     de: (t,u)=>`<div style="font-family:Arial,sans-serif;font-size:16px;color:#333"><p>Gute Nachrichten — <strong>${t}</strong> ist wieder vorrätig.</p><p><a href="${u}" style="padding:10px 14px;background:#111;color:#fff;text-decoration:none;border-radius:6px">Jetzt kaufen</a></p></div>`,
     fr: (t,u)=>`<div style="font-family:Arial,sans-serif;font-size:16px;color:#333"><p>Bonne nouvelle — <strong>${t}</strong> est de retour en stock.</p><p><a href="${u}" style="padding:10px 14px;background:#111;color:#fff;text-decoration:none;border-radius:6px">Je commande</a></p></div>`,
-    es: (t,u)=>`<div style="font-family:Arial,sans-serif;font-size:16px;color:#333"><p>Buenas noticias: <strong>${t}</strong> está de vuelta.</p><p><a href="${u}" style="padding:10px 14px	background:#111;color:#fff;text-decoration:none;border-radius:6px">Comprar ahora</a></p></div>`,
+    es: (t,u)=>`<div style="font-family:Arial,sans-serif;font-size:16px;color:#333"><p>Buenas noticias: <strong>${t}</strong> está de vuelta.</p><p><a href="${u}" style="padding:10px 14px\tbackground:#111;color:#fff;text-decoration:none;border-radius:6px">Comprar ahora</a></p></div>`,
     it: (t,u)=>`<div style="font-family:Arial,sans-serif;font-size:16px;color:#333"><p>Buone notizie — <strong>${t}</strong> è di nuovo disponibile.</p><p><a href="${u}" style="padding:10px 14px;background:#111;color:#fff;text-decoration:none;border-radius:6px">Acquista ora</a></p></div>`,
     nl: (t,u)=>`<div style="font-family:Arial,sans-serif;font-size:16px;color:#333"><p>Goed nieuws — <strong>${t}</strong> is weer op voorraad.</p><p><a href="${u}" style="padding:10px 14px;background:#111;color:#fff;text-decoration:none;border-radius:6px">Nu shoppen</a></p></div>`,
-    da: (t,u)=>`<div style="font-family:Arial,sans-serif;font-size:16px;color:#333"><p>Gode nyheder — <strong>${t}</strong> er tilbage på lager.</p><p><a href="${u}" style="padding:10px 14px	background:#111;color:#fff;text-decoration:none;border-radius:6px">Køb nu</a></p></div>`,
-    sv: (t,u)=>`<div style="font-family:Arial,sans-serif;font-size:16px;color:#333"><p>Goda nyheter — <strong>${t}</strong> är tillbaka i lager.</p><p><a href="${u}" style="padding:10px 14px	background:#111;color:#fff;text-decoration:none;border-radius:6px">Handla nu</a></p></div>`,
-    nb: (t,u)=>`<div style="font-family:Arial,sans-serif;font-size:16px;color:#333"><p>Godt nytt — <strong>${t}</strong> er tilbake på lager.</p><p><a href="${u}" style="padding:10px 14px	background:#111;color:#fff;text-decoration:none;border-radius:6px">Kjøp nå</a></p></div>`,
-    fi: (t,u)=>`<div style="font-family:Arial,sans-serif;font-size:16px;color:#333"><p>Hyviä uutisia — <strong>${t}</strong> on taas varastossa.</p><p><a href="${u}" style="padding:10px 14px	background:#111;color:#fff;text-decoration:none;border-radius:6px">Osta nyt</a></p></div>`,
-    cs: (t,u)=>`<div style="font-family:Arial,sans-serif;font-size:16px;color:#333"><p>Skvělé zprávy — <strong>${t}</strong> je opět skladem.</p><p><a href="${u}" style="padding:10px 14px	background:#111;color:#fff;text-decoration:none;border-radius:6px">Koupit nyní</a></p></div>`,
-    sk: (t,u)=>`<div style="font-family:Arial,sans-serif;font-size:16px;color:#333"><p>Skvelá správa — <strong>${t}</strong> je opäť na sklade.</p><p><a href="${u}" style="padding:10px 14px	background:#111;color:#fff;text-decoration:none;border-radius:6px">Kúpiť teraz</a></p></div>`,
-    sl: (t,u)=>`<div style="font-family:Arial,sans-serif;font-size:16px;color:#333"><p>Dobre novice — <strong>${t}</strong> je spet na zalogi.</p><p><a href="${u}" style="padding:10px 14px	background:#111;color:#fff;text-decoration:none;border-radius:6px">Nakupuj zdaj</a></p></div>`,
-    hu: (t,u)=>`<div style="font-family:Arial,sans-serif;font-size:16px;color:#333"><p>Jó hír — <strong>${t}</strong> újra készleten van.</p><p><a href="${u}" style="padding:10px 14px	background:#111;color:#fff;text-decoration:none;border-radius:6px">Vásárlás</a></p></div>`,
-    ro: (t,u)=>`<div style="font-family:Arial,sans-serif;font-size:16px;color:#333"><p>Veste bună — <strong>${t}</strong> este din nou în stoc.</p><p><a href="${u}" style="padding:10px 14px	background:#111;color:#fff;text-decoration:none;border-radius:6px">Cumpără acum</a></p></div>`,
-    pl: (t,u)=>`<div style="font-family:Arial,sans-serif;font-size:16px;color:#333"><p>Dobra wiadomość — <strong>${t}</strong> znów jest dostępny.</p><p><a href="${u}" style="padding:10px 14px	background:#111;color:#fff;text-decoration:none;border-radius:6px">Kup teraz</a></p></div>`,
-    pt: (t,u)=>`<div style="font-family:Arial,sans-serif;font-size:16px;color:#333"><p>Boa notícia — <strong>${t}</strong> está de volta ao estoque.</p><p><a href="${u}" style="padding:10px 14px	background:#111;color:#fff;text-decoration:none;border-radius:6px">Comprar agora</a></p></div>`,
-    bg: (t,u)=>`<div style="font-family:Arial,sans-serif;font-size:16px;color:#333"><p>Добра новина — <strong>${t}</strong> отново е наличен.</p><p><a href="${u}" style="padding:10px 14px	background:#111;color:#fff;text-decoration:none;border-radius:6px">Купи сега</a></p></div>`,
-    el: (t,u)=>`<div style="font-family:Arial,sans-serif;font-size:16px;color:#333"><p>Καλά νέα — το <strong>${t}</strong> είναι ξανά διαθέσιμο.</p><p><a href="${u}" style="padding:10px 14px	background:#111;color:#fff;text-decoration:none;border-radius:6px">Αγορά τώρα</a></p></div>`,
-    ru: (t,u)=>`<div style="font-family:Arial,sans-serif;font-size:16px;color:#333"><p>Отличная новость — <strong>${t}</strong> снова в наличии.</p><p><a href="${u}" style="padding:10px 14px	background:#111;color:#fff;text-decoration:none;border-radius:6px">Купить</a></p></div>`,
-    tr: (t,u)=>`<div style="font-family:Arial,sans-serif;font-size:16px;color:#333"><p>Harika haber — <strong>${t}</strong> yeniden stokta.</p><p><a href="${u}" style="padding:10px 14px	background:#111;color:#fff;text-decoration:none;border-radius:6px">Hemen al</a></p></div>`,
-    vi: (t,u)=>`<div style="font-family:Arial,sans-serif;font-size:16px;color:#333"><p>Tin vui — <strong>${t}</strong> đã có hàng trở lại.</p><p><a href="${u}" style="padding:10px 14px	background:#111;color:#fff;text-decoration:none;border-radius:6px">Mua ngay</a></p></div>`,
-    ja: (t,u)=>`<div style="font-family:Arial,sans-serif;font-size:16px;color:#333"><p>朗報です。<strong>${t}</strong> が再入荷しました。</p><p><a href="${u}" style="padding:10px 14px	background:#111;color:#fff;text-decoration:none;border-radius:6px">今すぐ購入</a></p></div>`,
-    ko: (t,u)=>`<div style="font-family:Arial,sans-serif;font-size:16px;color:#333"><p>좋은 소식 — <strong>${t}</strong> 가 재입고되었습니다.</p><p><a href="${u}" style="padding:10px 14px	background:#111;color:#fff;text-decoration:none;border-radius:6px">지금 구매</a></p></div>`,
-    'zh-cn': (t,u)=>`<div style="font-family:Arial,sans-serif;font-size:16px;color:#333"><p>好消息 — <strong>${t}</strong> 现已到货。</p><p><a href="${u}" style="padding:10px 14px	background:#111;color:#fff;text-decoration:none;border-radius:6px">立即购买</a></p></div>`,
-    'zh-tw': (t,u)=>`<div style="font-family:Arial,sans-serif;font-size:16px;color:#333"><p>好消息 — <strong>${t}</strong> 現已到貨。</p><p><a href="${u}" style="padding:10px 14px	background:#111;color:#fff;text-decoration:none;border-radius:6px">立即購買</a></p></div>`
+    da: (t,u)=>`<div style="font-family:Arial,sans-serif;font-size:16px;color:#333"><p>Gode nyheder — <strong>${t}</strong> er tilbage på lager.</p><p><a href="${u}" style="padding:10px 14px\tbackground:#111;color:#fff;text-decoration:none;border-radius:6px">Køb nu</a></p></div>`,
+    sv: (t,u)=>`<div style="font-family:Arial,sans-serif;font-size:16px;color:#333"><p>Goda nyheter — <strong>${t}</strong> är tillbaka i lager.</p><p><a href="${u}" style="padding:10px 14px\tbackground:#111;color:#fff;text-decoration:none;border-radius:6px">Handla nu</a></p></div>`,
+    nb: (t,u)=>`<div style="font-family:Arial,sans-serif;font-size:16px;color:#333"><p>Godt nytt — <strong>${t}</strong> er tilbake på lager.</p><p><a href="${u}" style="padding:10px 14px\tbackground:#111;color:#fff;text-decoration:none;border-radius:6px">Kjøp nå</a></p></div>`,
+    fi: (t,u)=>`<div style="font-family:Arial,sans-serif;font-size:16px;color:#333"><p>Hyviä uutisia — <strong>${t}</strong> on taas varastossa.</p><p><a href="${u}" style="padding:10px 14px\tbackground:#111;color:#fff;text-decoration:none;border-radius:6px">Osta nyt</a></p></div>`,
+    cs: (t,u)=>`<div style="font-family:Arial,sans-serif;font-size:16px;color:#333"><p>Skvělé zprávy — <strong>${t}</strong> je opět skladem.</p><p><a href="${u}" style="padding:10px 14px\tbackground:#111;color:#fff;text-decoration:none;border-radius:6px">Koupit nyní</a></p></div>`,
+    sk: (t,u)=>`<div style="font-family:Arial,sans-serif;font-size:16px;color:#333"><p>Skvelá správa — <strong>${t}</strong> je opäť na sklade.</p><p><a href="${u}" style="padding:10px 14px\tbackground:#111;color:#fff;text-decoration:none;border-radius:6px">Kúpiť teraz</a></p></div>`,
+    sl: (t,u)=>`<div style="font-family:Arial,sans-serif;font-size:16px;color:#333"><p>Dobre novice — <strong>${t}</strong> je spet na zalogi.</p><p><a href="${u}" style="padding:10px 14px\tbackground:#111;color:#fff;text-decoration:none;border-radius:6px">Nakupuj zdaj</a></p></div>`,
+    hu: (t,u)=>`<div style="font-family:Arial,sans-serif;font-size:16px;color:#333"><p>Jó hír — <strong>${t}</strong> újra készleten van.</p><p><a href="${u}" style="padding:10px 14px\tbackground:#111;color:#fff;text-decoration:none;border-radius:6px">Vásárlás</a></p></div>`,
+    ro: (t,u)=>`<div style="font-family:Arial,sans-serif;font-size:16px;color:#333"><p>Veste bună — <strong>${t}</strong> este din nou în stoc.</p><p><a href="${u}" style="padding:10px 14px\tbackground:#111;color:#fff;text-decoration:none;border-radius:6px">Cumpără acum</a></p></div>`,
+    pl: (t,u)=>`<div style="font-family:Arial,sans-serif;font-size:16px;color:#333"><p>Dobra wiadomość — <strong>${t}</strong> znów jest dostępny.</p><p><a href="${u}" style="padding:10px 14px\tbackground:#111;color:#fff;text-decoration:none;border-radius:6px">Kup teraz</a></p></div>`,
+    pt: (t,u)=>`<div style="font-family:Arial,sans-serif;font-size:16px;color:#333"><p>Boa notícia — <strong>${t}</strong> está de volta ao estoque.</p><p><a href="${u}" style="padding:10px 14px\tbackground:#111;color:#fff;text-decoration:none;border-radius:6px">Comprar agora</a></p></div>`,
+    bg: (t,u)=>`<div style="font-family:Arial,sans-serif;font-size:16px;color:#333"><p>Добра новина — <strong>${t}</strong> отново е наличен.</p><p><a href="${u}" style="padding:10px 14px\tbackground:#111;color:#fff;text-decoration:none;border-radius:6px">Купи сега</a></p></div>`,
+    el: (t,u)=>`<div style="font-family:Arial,sans-serif;font-size:16px;color:#333"><p>Καλά νέα — το <strong>${t}</strong> είναι ξανά διαθέσιμο.</p><p><a href="${u}" style="padding:10px 14px\tbackground:#111;color:#fff;text-decoration:none;border-radius:6px">Αγορά τώρα</a></p></div>`,
+    ru: (t,u)=>`<div style="font-family:Arial,sans-serif;font-size:16px;color:#333"><p>Отличная новость — <strong>${t}</strong> снова в наличии.</p><p><a href="${u}" style="padding:10px 14px\tbackground:#111;color:#fff;text-decoration:none;border-radius:6px">Купить</a></p></div>`,
+    tr: (t,u)=>`<div style="font-family:Arial,sans-serif;font-size:16px;color:#333"><p>Harika haber — <strong>${t}</strong> yeniden stokta.</p><p><a href="${u}" style="padding:10px 14px\tbackground:#111;color:#fff;text-decoration:none;border-radius:6px">Hemen al</a></p></div>`,
+    vi: (t,u)=>`<div style="font-family:Arial,sans-serif;font-size:16px;color:#333"><p>Tin vui — <strong>${t}</strong> đã có hàng trở lại.</p><p><a href="${u}" style="padding:10px 14px\tbackground:#111;color:#fff;text-decoration:none;border-radius:6px">Mua ngay</a></p></div>`,
+    ja: (t,u)=>`<div style="font-family:Arial,sans-serif;font-size:16px;color:#333"><p>朗報です。<strong>${t}</strong> が再入荷しました。</p><p><a href="${u}" style="padding:10px 14px\tbackground:#111;color:#fff;text-decoration:none;border-radius:6px">今すぐ購入</a></p></div>`,
+    ko: (t,u)=>`<div style="font-family:Arial,sans-serif;font-size:16px;color:#333"><p>좋은 소식 — <strong>${t}</strong> 가 재입고되었습니다.</p><p><a href="${u}" style="padding:10px 14px\tbackground:#111;color:#fff;text-decoration:none;border-radius:6px">지금 구매</a></p></div>`,
+    'zh-cn': (t,u)=>`<div style="font-family:Arial,sans-serif;font-size:16px;color:#333"><p>好消息 — <strong>${t}</strong> 现已到货.</p><p><a href="${u}" style="padding:10px 14px\tbackground:#111;color:#fff;text-decoration:none;border-radius:6px">立即购买</a></p></div>`,
+    'zh-tw': (t,u)=>`<div style="font-family:Arial,sans-serif;font-size:16px;color:#333"><p>好消息 — <strong>${t}</strong> 現已到貨。</p><p><a href="${u}" style="padding:10px 14px\tbackground:#111;color:#fff;text-decoration:none;border-radius:6px">立即購買</a></p></div>`
   }
 };
 function pickLoc(str, fallback = 'en') {
@@ -1729,4 +1729,3 @@ app.get('/health', (_req, res) => res.json({ ok: true, service: 'lottery+bis', v
 app.listen(port, host, () => {
   console.log(`✅ Lottery/BIS server listening on ${host}:${port}`);
 });
-
