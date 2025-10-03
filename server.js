@@ -1501,6 +1501,17 @@ app.get('/admin/campaign/new', (req, res) => {
   `);
 });
 
+app.get('/__routes', (_req, res) => {
+  const routes = [];
+  app._router.stack.forEach((m) => {
+    if (m.route && m.route.path) {
+      const methods = Object.keys(m.route.methods).join(',').toUpperCase();
+      routes.push(`${methods} ${m.route.path}`);
+    }
+  });
+  res.type('text').send(routes.sort().join('\n'));
+});
+
 // Create campaign handler
 app.post('/admin/campaign/create', (req, res) => {
   if (!isAdmin(req)) return res.status(403).send('Forbidden');
