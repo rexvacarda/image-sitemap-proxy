@@ -1663,6 +1663,76 @@ app.get('/admin/campaign/run', async (req, res) => {
     }
   });
 });
+// --- ADMIN: simple "New Campaign" page (reuses /admin/email sender) ---
+app.get('/admin/campaign/new', async (req, res) => {
+  if (!isAdmin(req)) return res.status(403).send('Forbidden');
+
+  // Optional: show locale counts from Shopify so choosing a segment is easier
+  let localeCountsHtml = '';
+  try {
+    const rows = await fetchAllSubscribedCustomersFromShopify();
+    const counts = {};
+    for (const r of rows) counts[r.short_locale || 'en'] = (counts[r.short_locale || 'en'] || 0) + 1;
+    const items = Object.entries(counts)
+      .sort((a,b) => a[0].localeCompare(b[0]))
+      .map(([loc, n]) => `<option value="${loc}">${loc} (${n})</option>`)
+      .join('');
+    localeCountsHtml = `
+      <label>Segment (optional):</label>
+      <select name="segment" style="padding:8px;width:260px">
+        <option value="">All customers</option>
+        ${items}
+      </select>`;
+  } catch {
+    // If Shopify look-up fails, just show a free text input for segment
+    localeCountsHtml = `
+      <label>Segment (optional, e.g. "en" or "de"):</label>
+      <input name="segment" placeholder="en, de, fr..." style="padding:8px;width:260px">`;
+  }
+
+  res.send(`
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <div style="max-width:900px;margin:24px auto;font:16px/1.45 Arial,sans-serif;color:#222">
+      <h2 style="margin:0 0 12px">New Campaign</h2>
+      <form method="POST" action="/admin/email">
+        <input type="hidden" name="pass" value="${(req.query.pass || '')}">
+        <div style="margin:12px 0">
+          ${localeCountsHtml}
+        </div>
+        <div style="margin:12px 0">
+          <label>Subject</label><br>
+          <input name="subject" required style="width:100%;padding:10px" placeholder="Your subject">
+        </div>
+        <div style="margin:12px 0">
+          <label>HTML</label><br>
+          <textarea name="html" required rows="14" style="width:100%;padding:10px;font-family:monospace"></textarea>
+          <small style="color:#666;display:block">We’ll append the unsubscribe footer + add a List-Unsubscribe header.</small>
+        </div>
+
+        <div style="display:flex;gap:12px;flex-wrap:wrap;margin:12px 0">
+          <label>Max recipients (this run):
+            <input type="number" name="limit" value="500" min="1" max="10000" style="width:120px;padding:8px">
+          </label>
+          <label>Start after customer ID:
+            <input type="number" name="since_id" value="0" style="width:160px;padding:8px">
+          </label>
+          <label><input type="checkbox" name="dry" checked> Dry run (preview only)</label>
+          <label>Test to (optional email):
+            <input type="email" name="test_to" placeholder="you@example.com" style="width:220px;padding:8px">
+          </label>
+        </div>
+
+        <button type="submit" style="padding:10px 16px;background:#111;color:#fff;border:0;border-radius:6px">Send</button>
+      </form>
+    </div>
+  `);
+});
+
+// Optional convenience redirect so /campaign/new works too
+app.get('/campaign/new', (req, res) => {
+  const pass = req.query.pass || '';
+  res.redirect(`/admin/campaign/new?pass=${encodeURIComponent(pass)}`);
+});
 
 // --- PUBLIC: list current active lotteries ---
 app.get('/lottery/current', (req, res) => {
