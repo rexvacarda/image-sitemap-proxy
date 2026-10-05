@@ -12,8 +12,8 @@ Required:
   SHARED_SECRET
 Optional (recommended):
   STOREFRONT_TOKEN   -> enables fully localized fetch via Storefront API
-  SF_API_VERSION     -> default 2024-07
-  API_VERSION        -> default 2024-04
+  SF_API_VERSION     -> default 2026-04
+  API_VERSION        -> default 2026-04
   CACHE_TTL_SECONDS  -> default 900
   MAX_URLS_PER_FEED  -> default 5000
   DEFAULT_PER_PAGE   -> default 200
@@ -26,9 +26,11 @@ const SHOP = process.env.SHOP || "";
 const ADMIN_API_TOKEN = process.env.ADMIN_API_TOKEN || "";
 const SHARED_SECRET = process.env.SHARED_SECRET || "";
 const STOREFRONT_TOKEN = process.env.STOREFRONT_TOKEN || "";
-const SF_API_VERSION = process.env.SF_API_VERSION || "2024-07";
 
-const API_VERSION = process.env.API_VERSION || "2024-04";
+// FIX 3: current API versions (override via env if you want to pin a different one)
+const SF_API_VERSION = process.env.SF_API_VERSION || "2026-04";
+const API_VERSION = process.env.API_VERSION || "2026-04";
+
 const CACHE_TTL_SECONDS = Number(process.env.CACHE_TTL_SECONDS || 900);
 const MAX_URLS_PER_FEED = Number(process.env.MAX_URLS_PER_FEED || 5000);
 const DEFAULT_PER_PAGE = Math.min(Number(process.env.DEFAULT_PER_PAGE || 200), MAX_URLS_PER_FEED);
@@ -72,7 +74,8 @@ function pageUrlForProduct(host, handle, onlineStoreUrl, locale){
   }
 
   return `https://${h}${localePrefix}/products/${handle}`;
-}function pageUrlForCollection(host, handle){
+}
+function pageUrlForCollection(host, handle){
   const h=stripPort(host);
   return `https://${h}/collections/${handle}`;
 }
@@ -124,32 +127,32 @@ function getLocaleForHost(host, override) {
   return "en";
 }
 
-function numericIdFromGid(gid){ if(!gid) return null; const parts=String(gid).split("/"); return parts.length?parts[parts.length-1]:null; }
+/* FIX 1: map site locale -> Shopify Storefront LanguageCode enum (used with @inContext).
+   Add more entries here if you enable other languages in Shopify. */
+const SF_LANG = {
+  en: "EN", fr: "FR", it: "IT", ja: "JA", ko: "KO", ar: "AR", he: "HE",
+  nl: "NL", de: "DE", da: "DA", pl: "PL", "pt-pt": "PT_PT", pt: "PT_PT",
+  "zh-hans": "ZH_CN", "zh-cn": "ZH_CN", "zh-hant": "ZH_TW", "zh-tw": "ZH_TW",
+};
+function sfLanguageFor(locale){
+  return SF_LANG[String(locale || "en").toLowerCase()] || "EN";
+}
+
 async function timedFetch(url, opts={}, timeoutMs=HTTP_TIMEOUT_MS){
   const c=new AbortController(); const t=setTimeout(()=>c.abort(),timeoutMs);
   try{return await fetch(url,{...opts,signal:c.signal});} finally{clearTimeout(t);}
 }
-async function pMap(items, limit, mapper){
-  const ret=[]; const running=[];
-  for(const item of items){
-    const p=Promise.resolve().then(()=>mapper(item));
-    ret.push(p);
-    const e=p.then(()=>running.splice(running.indexOf(e),1));
-    running.push(e);
-    if(running.length>=limit) await Promise.race(running);
-  }
-  return Promise.all(ret);
-}
 
-/* ---------- Storefront API (localized) — FIXED PAGINATION ---------- */
+/* ---------- Storefront API (localized) — cursor pagination ---------- */
 
-async function sfGraphQL(query, variables, acceptLanguage){
+async function sfGraphQL(query, variables){
   const resp = await timedFetch(`https://${SHOP}/api/${SF_API_VERSION}/graphql.json`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      "X-Shopify-Storefront-Access-Token": STOREFRONT_TOKEN,
-      ...(acceptLanguage ? { "Accept-Language": acceptLanguage } : {})
+      "X-Shopify-Storefront-Access-Token": STOREFRONT_TOKEN
+      // FIX 1: no Accept-Language header — Storefront API ignores it.
+      // Language is set with @inContext(language: ...) in the query instead.
     },
     body: JSON.stringify({ query, variables })
   });
@@ -157,7 +160,12 @@ async function sfGraphQL(query, variables, acceptLanguage){
     const text = await resp.text();
     throw new Error(`Storefront API ${resp.status}: ${text}`);
   }
-  return resp.json();
+  const json = await resp.json();
+  // GraphQL can return HTTP 200 with errors; surface them instead of silently returning empty feeds
+  if (json.errors?.length) {
+    throw new Error(`Storefront API GraphQL errors: ${JSON.stringify(json.errors)}`);
+  }
+  return json;
 }
 
 /**
@@ -165,16 +173,16 @@ async function sfGraphQL(query, variables, acceptLanguage){
  * - Skip phase: advance by batches until we pass `offset`
  * - Collect phase: collect exactly `take` items
  */
-async function sfPagedSlice({ type, first, offset, take, acceptLanguage }) {
+async function sfPagedSlice({ type, first, offset, take, locale }) {
   let after = null;
   let skipped = 0;
   const out = [];
+  const language = sfLanguageFor(locale);
 
-  // queries return edges { cursor node { ... } } + pageInfo
   const isProducts = type === "products";
   const query = isProducts
     ? `
-      query($first:Int!, $after:String) {
+      query($first:Int!, $after:String, $language:LanguageCode!) @inContext(language:$language) {
         products(first:$first, after:$after, sortKey:UPDATED_AT, reverse:true) {
           edges {
             cursor
@@ -190,13 +198,14 @@ async function sfPagedSlice({ type, first, offset, take, acceptLanguage }) {
         }
       }`
     : `
-      query($first:Int!, $after:String) {
+      query($first:Int!, $after:String, $language:LanguageCode!) @inContext(language:$language) {
         collections(first:$first, after:$after, sortKey:UPDATED_AT, reverse:true) {
           edges {
             cursor
             node {
               handle
               title
+              onlineStoreUrl
               updatedAt
               image { url altText }
             }
@@ -213,7 +222,7 @@ async function sfPagedSlice({ type, first, offset, take, acceptLanguage }) {
   // --- Skip phase
   while (skipped < offset) {
     const want = Math.min(first, offset - skipped);
-    const resp = await sfGraphQL(query, { first: want, after }, acceptLanguage);
+    const resp = await sfGraphQL(query, { first: want, after, language });
     const edges = selectEdges(resp);
     if (!edges.length) break;
     skipped += edges.length;
@@ -226,7 +235,7 @@ async function sfPagedSlice({ type, first, offset, take, acceptLanguage }) {
   while (out.length < take) {
     const need = take - out.length;
     const want = Math.min(first, need);
-    const resp = await sfGraphQL(query, { first: want, after }, acceptLanguage);
+    const resp = await sfGraphQL(query, { first: want, after, language });
     const edges = selectEdges(resp);
     if (!edges.length) break;
     for (const e of edges) {
@@ -241,18 +250,16 @@ async function sfPagedSlice({ type, first, offset, take, acceptLanguage }) {
   return out;
 }
 
-// New SF helpers that use cursor pagination above
-async function sfGetProductsSlice(offset, limit, acceptLanguage){
-  // batch size for Storefront; 100 is safe
-  return sfPagedSlice({ type: "products", first: 100, offset, take: limit, acceptLanguage });
+async function sfGetProductsSlice(offset, limit, locale){
+  return sfPagedSlice({ type: "products", first: 100, offset, take: limit, locale });
 }
-async function sfGetCollectionsSlice(offset, limit, acceptLanguage){
-  return sfPagedSlice({ type: "collections", first: 100, offset, take: limit, acceptLanguage });
+async function sfGetCollectionsSlice(offset, limit, locale){
+  return sfPagedSlice({ type: "collections", first: 100, offset, take: limit, locale });
 }
 
 /* ---------- Admin API (fallback) ---------- */
 
-async function gqlPagedSlice({ query, selectEdges, first, offset, take }){
+async function gqlPagedSlice({ query, selectEdges, selectPageInfo, first, offset, take }){
   let after=null; let skipped=0; const out=[];
   while(out.length<take){
     const resp=await timedFetch(`https://${SHOP}/admin/api/${API_VERSION}/graphql.json`,{
@@ -262,13 +269,14 @@ async function gqlPagedSlice({ query, selectEdges, first, offset, take }){
     });
     if(!resp.ok){ const text=await resp.text(); throw new Error(`Admin API ${resp.status}: ${text}`); }
     const json=await resp.json();
+    if(json.errors?.length) throw new Error(`Admin API GraphQL errors: ${JSON.stringify(json.errors)}`);
     const edges=selectEdges(json)||[];
     if(!edges.length) break;
     for(const e of edges){
       if(skipped<offset) skipped+=1;
       else if(out.length<take) out.push(e.node);
     }
-    const pageInfo=edges.length?json.data[Object.keys(json.data)[0]].pageInfo:{hasNextPage:false};
+    const pageInfo=selectPageInfo(json);
     if(!pageInfo?.hasNextPage||out.length>=take) break;
     after=edges[edges.length-1].cursor;
   }
@@ -276,9 +284,11 @@ async function gqlPagedSlice({ query, selectEdges, first, offset, take }){
 }
 
 async function getProductsSlice(offset, limit){
+  // FIX 2: only active AND published products (unpublished ones would 404 on the storefront)
+  // FIX 3: images -> media (Product.images is deprecated); only MediaImage nodes carry image data
   const query=`
     query Products($first:Int!, $after:String) {
-      products(first:$first, after:$after, query:"status:active", sortKey:UPDATED_AT, reverse:true) {
+      products(first:$first, after:$after, query:"status:active published_status:published", sortKey:UPDATED_AT, reverse:true) {
         edges {
           cursor
           node {
@@ -287,13 +297,22 @@ async function getProductsSlice(offset, limit){
             handle
             onlineStoreUrl
             updatedAt
-            images(first:50) { edges { node { id url altText } } }
+            media(first:50) {
+              nodes {
+                ... on MediaImage { image { url altText } }
+              }
+            }
           }
         }
         pageInfo { hasNextPage }
       }
     }`;
-  return gqlPagedSlice({ query, selectEdges:j=>j?.data?.products?.edges, first:100, offset, take:limit });
+  return gqlPagedSlice({
+    query,
+    selectEdges:j=>j?.data?.products?.edges,
+    selectPageInfo:j=>j?.data?.products?.pageInfo,
+    first:100, offset, take:limit
+  });
 }
 
 async function getCollectionsSlice(offset, limit){
@@ -313,7 +332,18 @@ async function getCollectionsSlice(offset, limit){
         pageInfo { hasNextPage }
       }
     }`;
-  return gqlPagedSlice({ query, selectEdges:j=>j?.data?.collections?.edges, first:200, offset, take:limit });
+  return gqlPagedSlice({
+    query,
+    selectEdges:j=>j?.data?.collections?.edges,
+    selectPageInfo:j=>j?.data?.collections?.pageInfo,
+    first:200, offset, take:limit
+  });
+}
+
+/** Normalise product images from either API into [{url, altText}] */
+function productImages(p, useSF){
+  if (useSF) return (p.images?.nodes || []).filter(i => i?.url);
+  return (p.media?.nodes || []).map(n => n?.image).filter(i => i?.url);
 }
 
 /* ---------- XML builders ---------- */
@@ -363,15 +393,11 @@ app.get("/image.xml", async (req,res)=>{
         : await getProductsSlice(offset, perPage);
 
       for (const p of products){
-        const handle = p.handle;
-        const pageUrl = pageUrlForProduct(
-          host,
-          handle,
-          p.onlineStoreUrl,
-          locale
-      );
-        const updatedAt = p.updatedAt;
-        const imagesArr = useSF ? (p.images?.nodes || []) : ((p.images?.edges || []).map(e=>e.node));
+        // FIX 2: skip products with no live storefront URL (not published to the Online Store)
+        if(!p.onlineStoreUrl) continue;
+
+        const pageUrl = pageUrlForProduct(host, p.handle, p.onlineStoreUrl, locale);
+        const imagesArr = productImages(p, useSF);
         if(!imagesArr.length) continue;
 
         const localizedTitle = p.title || "";
@@ -381,7 +407,7 @@ app.get("/image.xml", async (req,res)=>{
           return buildImageNode(imgUrl, resolved, resolved);
         });
 
-        nodes.push(buildUrlNode(pageUrl, updatedAt, imageNodes));
+        nodes.push(buildUrlNode(pageUrl, p.updatedAt, imageNodes));
       }
     }
 
@@ -392,16 +418,19 @@ app.get("/image.xml", async (req,res)=>{
         : await getCollectionsSlice(offset, perPage);
 
       for (const c of collections){
-        const pageUrl = pageUrlForCollection(host, c.handle);
-        const updatedAt = c.updatedAt;
+        // FIX 2: Storefront returns onlineStoreUrl for collections; skip unpublished ones.
+        // (Admin path is already filtered with published_status:published.)
+        if(useSF && !c.onlineStoreUrl) continue;
+
         const imgObj = c.image;
         if (!imgObj?.url) continue;
 
+        const pageUrl = pageUrlForCollection(host, c.handle);
         const imgUrl = preferHost ? preferHostImageUrl(imgObj.url, host) : imgObj.url;
         const resolved = (imgObj.altText && imgObj.altText.trim()) ? imgObj.altText : (c.title || "");
         const imageNodes = [buildImageNode(imgUrl, resolved, resolved)];
 
-        nodes.push(buildUrlNode(pageUrl, updatedAt, imageNodes));
+        nodes.push(buildUrlNode(pageUrl, c.updatedAt, imageNodes));
       }
     }
 
